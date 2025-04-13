@@ -1,0 +1,220 @@
+technical_indicators:
+  ema_indicators:
+    enabled: true
+    periods: [20, 100, 200]
+    timeframes: ["5m", "10m", "15m"]
+    price_columns: ["ATM_Straddle_Premium", "ATM_CE_Premium", "ATM_PE_Premium"]
+    use_slope: true
+    use_crossover: true
+    use_alignment: true
+    
+  atr_indicators:
+    enabled: true
+    atr_period: 14
+    percentile_lookback: 100
+    ema_periods: [20, 50, 100]
+    timeframes: ["5m", "10m", "15m"]
+    
+  iv_indicators:
+    enabled: true
+    lookback_period: 60
+    dte_specific_lookback: true
+    dte_lookback_mapping:
+      "0-7": 30
+      "8-14": 60
+      "15-30": 90
+      "31-60": 120
+      "61-90": 180
+      "91+": 252
+    dte_buckets: [0, 7, 14, 30, 60, 90]
+    use_skew: true
+    use_term_structure: true
+    
+  premium_indicators:
+    enabled: true
+    lookback_period: 60
+    dte_buckets: [0, 7, 14, 30, 60, 90]
+    use_ratio: true
+    use_trend: true
+    
+  trending_oi_pa:
+    enabled: true
+    oi_lookback: 10
+    price_lookback: 5
+    divergence_threshold: 0.1
+    accumulation_threshold: 0.2
+    use_percentile: true
+    percentile_window: 20
+    timeframes: ["5m", "10m", "15m"]
+    oi_velocity_periods: [1, 3, 5]
+    oi_acceleration_periods: [1, 3]
+    strike_range: 5
+    oi_distribution_buckets: 10
+    magnet_strength_factor: 0.5
+    trend_reversal_threshold: 0.3
+    dte_specific: true
+    dte_buckets: [0, 7, 14, 30, 60, 90]
+    
+  greek_sentiment:
+    enabled: true
+    lookback_period: 20
+    gamma_threshold: 0.7
+    delta_threshold: 0.6
+    sentiment_weight: 0.4
+    use_put_skew: true
+    use_call_put_ratio: true
+    delta_weight: 0.4
+    gamma_weight: 0.3
+    theta_weight: 0.2
+    vega_weight: 0.1
+    dte_specific: true
+    dte_buckets: [0, 7, 14, 30, 60, 90]
+    extreme_threshold: 0.8
+    trend_lookback: 5
+    reversal_threshold: 0.3
+    
+  vwap_indicators:
+    enabled: true
+    band_multipliers: [1.0, 1.5, 2.0, 2.5, 3.0]
+    use_prev_day: true
+    timeframes: ["5m", "10m", "15m"]
+    
+  volume_indicators:
+    enabled: true
+    lookback_period: 20
+    spike_threshold: 2.0
+    use_percentile: true
+    timeframes: ["5m", "10m", "15m"]
+
+market_regime:
+  # Directional regime thresholds
+  directional_regimes:
+    strong_bullish:
+      min_threshold: 0.6
+      max_threshold: 1.0
+    bullish:
+      min_threshold: 0.2
+      max_threshold: 0.6
+    neutral:
+      min_threshold: -0.2
+      max_threshold: 0.2
+    bearish:
+      min_threshold: -0.6
+      max_threshold: -0.2
+    strong_bearish:
+      min_threshold: -1.0
+      max_threshold: -0.6
+      
+  # Volatility regime thresholds
+  volatility_regimes:
+    very_low_vol:
+      min_percentile: 0
+      max_percentile: 20
+    low_vol:
+      min_percentile: 20
+      max_percentile: 40
+    normal_vol:
+      min_percentile: 40
+      max_percentile: 60
+    high_vol:
+      min_percentile: 60
+      max_percentile: 80
+    extreme_vol:
+      min_percentile: 80
+      max_percentile: 100
+      
+  # Liquidity regime thresholds
+  liquidity_regimes:
+    high_liquidity:
+      min_percentile: 75
+      max_percentile: 100
+    normal_liquidity:
+      min_percentile: 50
+      max_percentile: 75
+    low_liquidity:
+      min_percentile: 25
+      max_percentile: 50
+    very_low_liquidity:
+      min_percentile: 0
+      max_percentile: 25
+      
+  # Composite regime naming
+  composite_regimes:
+    high_volatility:
+      strong_bullish: "high_voltatile_strong_bullish"
+      bullish: "high_voltatile_mild_bullish"
+      neutral: "high_voltatile_sideways_neutral"
+      bearish: "high_voltatile_mild_bearish"
+      strong_bearish: "high_voltatile_strong_bearish"
+    low_volatility:
+      strong_bullish: "Low_volatole_strong_bullish"
+      bullish: "Low_volatole_mild_bullish"
+      neutral: "Low_volatole_sideways_bearish"
+      bearish: "Low_volatole_mild_bearish"
+      strong_bearish: "Low_volatole_strong_bearish"
+
+dynamic_weighting:
+  # Default component weights
+  default_weights:
+    greek_sentiment: 0.4
+    trending_oi_pa: 0.2
+    technical: 0.2
+    volatility: 0.1
+    liquidity: 0.1
+    
+  # Dynamic adjustment settings
+  adjustment:
+    enabled: true
+    performance_window: 20
+    max_adjustment_factor: 2.0
+    min_weight_factor: 0.5
+    update_frequency: 5
+    
+  # Performance metrics for weight adjustment
+  performance_metrics:
+    accuracy_weight: 0.6
+    precision_weight: 0.2
+    recall_weight: 0.2
+
+confidence_score:
+  enabled: true
+  threshold: 0.7
+  min_duration_minutes: 3
+  temporal_smoothing_points: 5
+  hysteresis_band: 0.1
+  calculation:
+    signal_strength_weight: 0.4
+    consistency_weight: 0.3
+    indicator_agreement_weight: 0.3
+
+data_processing:
+  # Symbol-specific settings
+  symbols:
+    NIFTY:
+      atm_range: 0.5
+      strike_step: 50
+      
+  # DTE bucketing
+  dte_buckets:
+    weekly: [0, 7]
+    biweekly: [8, 14]
+    monthly: [15, 30]
+    quarterly: [31, 90]
+    
+  # Timeframe settings
+  timeframes:
+    - name: "5m"
+      minutes: 5
+      lookback: 60
+    - name: "10m"
+      minutes: 10
+      lookback: 30
+    - name: "15m"
+      minutes: 15
+      lookback: 20
+      
+  # Data filtering
+  filtering:
+    min_volume: 10
+    min_open_interest: 100
+    exclude_illiquid_strikes: true
