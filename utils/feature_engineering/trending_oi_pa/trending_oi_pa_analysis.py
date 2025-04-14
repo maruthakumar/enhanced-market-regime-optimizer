@@ -1,35 +1,46 @@
 """
-Consolidated Trending OI with PA Analysis Module
+Enhanced Trending OI with PA Analysis Module
 
-This module implements Trending Open Interest with Price Action analysis,
+This module implements comprehensive Trending Open Interest with Price Action analysis,
 analyzing ATM plus 7 strikes above and 7 strikes below (total of 15 strikes)
-and implementing rolling calculation for trending OI of calls and puts.
+and implementing advanced OI pattern recognition across these strikes.
 
 Features:
-- OI trends analysis
-- OI accumulation detection
-- Price momentum relative to OI changes
-- Breakout/breakdown confirmation with OI
-- Support/resistance tests with OI confirmation
-- Divergence/convergence between OI and price
+- OI trends analysis across 15 strikes
+- OI velocity and acceleration calculation
+- Strike skew analysis for OI distribution
+- OI divergence from price action detection
+- Time decay impact on OI patterns
+- Cross-expiry OI analysis
+- Institutional vs. retail positioning analysis
+- Historical pattern behavior analysis
+- Short build-up, short covering, short unwinding, long build-up, and long unwinding detection
+- Combined call-put pattern identification at the same strike prices
+- Pattern divergence analysis
+- Historical pattern performance tracking
 """
 
 import pandas as pd
 import numpy as np
 import logging
+import pickle
+import os
 from datetime import datetime, timedelta
+from scipy.stats import skew, kurtosis, pearsonr
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
 # Setup logging
 logger = logging.getLogger(__name__)
 
 class TrendingOIWithPAAnalysis:
     """
-    Consolidated Trending OI with PA Analysis.
+    Enhanced Trending OI with PA Analysis.
     
-    This class implements analysis of Open Interest trends and their relationship
+    This class implements comprehensive analysis of Open Interest trends and their relationship
     with Price Action, focusing on ATM plus 7 strikes above and 7 strikes below
-    (total of 15 strikes) and implementing rolling calculation for trending OI
-    of calls and puts.
+    (total of 15 strikes) and implementing advanced OI pattern recognition across these strikes.
     """
     
     def __init__(self, config=None):
@@ -66,140 +77,214 @@ class TrendingOIWithPAAnalysis:
         self.strong_trend_threshold = float(self.config.get('strong_trend_threshold', 0.10))  # 10% change
         self.weak_trend_threshold = float(self.config.get('weak_trend_threshold', 0.05))  # 5% change
         
-        logger.info(f"Initialized Trending OI with PA Analysis with default weight {self.default_weight}")
+        # OI velocity and acceleration thresholds
+        self.high_velocity_threshold = float(self.config.get('high_velocity_threshold', 0.03))  # 3% change per period
+        self.high_acceleration_threshold = float(self.config.get('high_acceleration_threshold', 0.01))  # 1% change in velocity
+        
+        # Lot size thresholds for institutional vs. retail
+        self.institutional_lot_size = int(self.config.get('institutional_lot_size', 100))  # 100 lots or more is institutional
+        
+        # Pattern recognition parameters
+        self.pattern_lookback = int(self.config.get('pattern_lookback', 20))  # 20 periods lookback
+        self.pattern_similarity_threshold = float(self.config.get('pattern_similarity_threshold', 0.80))  # 80% similarity
+        
+        # Dynamic weight adjustment parameters
+        self.use_dynamic_weights = bool(self.config.get('use_dynamic_weights', True))
+        self.learning_rate = float(self.config.get('learning_rate', 0.1))
+        
+        # Historical pattern analysis parameters
+        self.history_window = int(self.config.get('history_window', 60))  # 60 periods for historical analysis
+        self.pattern_performance_lookback = int(self.config.get('pattern_performance_lookback', 5))  # Look 5 periods ahead for performance
+        self.pattern_history_file = self.config.get('pattern_history_file', 'pattern_history.pkl')
+        self.min_pattern_occurrences = int(self.config.get('min_pattern_occurrences', 10))  # Minimum occurrences for reliable stats
+        
+        # Pattern divergence analysis parameters
+        self.divergence_threshold = float(self.config.get('divergence_threshold', 0.3))  # 30% divergence threshold
+        self.divergence_window = int(self.config.get('divergence_window', 10))  # 10 periods for divergence analysis
+        
+        # Initialize pattern history storage
+        self.pattern_history = {
+            'Strong_Bullish': {'occurrences': 0, 'success_rate': 0, 'avg_return': 0, 'avg_duration': 0},
+            'Mild_Bullish': {'occurrences': 0, 'success_rate': 0, 'avg_return': 0, 'avg_duration': 0},
+            'Neutral': {'occurrences': 0, 'success_rate': 0, 'avg_return': 0, 'avg_duration': 0},
+            'Sideways': {'occurrences': 0, 'success_rate': 0, 'avg_return': 0, 'avg_duration': 0},
+            'Sideways_To_Bullish': {'occurrences': 0, 'success_rate': 0, 'avg_return': 0, 'avg_duration': 0},
+            'Sideways_To_Bearish': {'occurrences': 0, 'success_rate': 0, 'avg_return': 0, 'avg_duration': 0},
+            'Mild_Bearish': {'occurrences': 0, 'success_rate': 0, 'avg_return': 0, 'avg_duration': 0},
+            'Strong_Bearish': {'occurrences': 0, 'success_rate': 0, 'avg_return': 0, 'avg_duration': 0}
+        }
+        
+        # Load existing pattern history if available
+        self._load_pattern_history()
+        
+        logger.info(f"Initialized Enhanced Trending OI with PA Analysis with default weight {self.default_weight}")
         logger.info(f"Using {self.strikes_above_atm} strikes above ATM and {self.strikes_below_atm} strikes below ATM")
+        logger.info(f"Historical pattern analysis enabled with {self.history_window} periods window")
     
-    def calculate_features(self, data_frame, **kwargs):
+    def _load_pattern_history(self):
         """
-        Calculate Trending OI with PA Analysis features.
+        Load pattern history from file if available.
+        """
+        try:
+            if os.path.exists(self.pattern_history_file):
+                with open(self.pattern_history_file, 'rb') as f:
+                    self.pattern_history = pickle.load(f)
+                logger.info(f"Loaded pattern history from {self.pattern_history_file}")
+            else:
+                logger.info(f"No pattern history file found at {self.pattern_history_file}, using default values")
+        except Exception as e:
+            logger.error(f"Error loading pattern history: {str(e)}")
+    
+    def _save_pattern_history(self):
+        """
+        Save pattern history to file.
+        """
+        try:
+            with open(self.pattern_history_file, 'wb') as f:
+                pickle.dump(self.pattern_history, f)
+            logger.info(f"Saved pattern history to {self.pattern_history_file}")
+        except Exception as e:
+            logger.error(f"Error saving pattern history: {str(e)}")
+    
+    def analyze_oi_patterns(self, data):
+        """
+        Analyze OI patterns from options data.
         
         Args:
-            data_frame (pd.DataFrame): Input data
-            **kwargs: Additional arguments
-                - price_column (str): Column name for price
-                - call_oi_column (str): Column name for call open interest
-                - put_oi_column (str): Column name for put open interest
-                - volume_column (str): Column name for volume
-                - strike_column (str): Column name for strike price
-                - date_column (str): Column name for date
-                - time_column (str): Column name for time
-                - expiry_column (str): Column name for expiry date
-                - dte_column (str): Column name for DTE
-                - specific_dte (int): Specific DTE to use for calculations
+            data (pd.DataFrame): Options data with OI
             
         Returns:
-            pd.DataFrame: Data with calculated Trending OI with PA Analysis features
+            pd.DataFrame: Data with OI pattern analysis
         """
         # Make a copy to avoid modifying the original
-        df = data_frame.copy()
-        
-        # Get column names from kwargs or use defaults
-        price_column = kwargs.get('price_column', 'Close')
-        call_oi_column = kwargs.get('call_oi_column', 'Call_OI')
-        put_oi_column = kwargs.get('put_oi_column', 'Put_OI')
-        volume_column = kwargs.get('volume_column', 'Volume')
-        strike_column = kwargs.get('strike_column', 'Strike')
-        date_column = kwargs.get('date_column', 'Date')
-        time_column = kwargs.get('time_column', 'Time')
-        expiry_column = kwargs.get('expiry_column', 'Expiry')
-        dte_column = kwargs.get('dte_column', 'DTE')
+        df = data.copy()
         
         # Check if required columns exist
-        required_columns = [
-            price_column, call_oi_column, put_oi_column,
-            volume_column, strike_column
-        ]
+        required_columns = ['datetime', 'strike', 'option_type', 'open_interest', 'price', 'underlying_price']
         missing_columns = [col for col in required_columns if col not in df.columns]
         
         if missing_columns:
-            logger.warning(f"Missing required columns: {missing_columns}")
-            return df
+            # Try to find alternative column names
+            column_mapping = {
+                'datetime': ['timestamp', 'date_time', 'time'],
+                'strike': ['Strike', 'strike_price', 'STRIKE'],
+                'option_type': ['type', 'call_put', 'cp', 'option_type'],
+                'open_interest': ['OI', 'OPEN_INTEREST', 'oi'],
+                'price': ['close', 'Close', 'CLOSE', 'last_price'],
+                'underlying_price': ['underlying', 'Underlying', 'spot_price', 'index_price']
+            }
+            
+            for missing_col in missing_columns:
+                for alt_col in column_mapping.get(missing_col, []):
+                    if alt_col in df.columns:
+                        df[missing_col] = df[alt_col]
+                        logger.info(f"Using {alt_col} as {missing_col}")
+                        break
+            
+            # Check again after mapping
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            
+            if missing_columns:
+                logger.warning(f"Missing required columns after mapping: {missing_columns}")
+                return df
         
-        # Step 1: Identify ATM strike
-        atm_strike = self._identify_atm_strike(df, price_column, strike_column)
+        # Ensure datetime is in datetime format
+        if not pd.api.types.is_datetime64_any_dtype(df['datetime']):
+            try:
+                df['datetime'] = pd.to_datetime(df['datetime'])
+            except:
+                logger.warning("Failed to convert datetime column to datetime format")
+                return df
         
-        # Step 2: Select strikes to analyze
-        selected_strikes = self._select_strikes(df, atm_strike, strike_column)
+        # Sort by datetime and strike
+        df = df.sort_values(['datetime', 'strike'])
         
-        # Step 3: Calculate OI trends
-        oi_trends = self._calculate_oi_trends(df, selected_strikes, call_oi_column, put_oi_column, strike_column, date_column, time_column)
-        df['Call_OI_Trend'] = oi_trends['call_trend']
-        df['Put_OI_Trend'] = oi_trends['put_trend']
-        df['Net_OI_Trend'] = oi_trends['net_trend']
+        # Get unique timestamps
+        timestamps = df['datetime'].unique()
         
-        # Step 4: Calculate rolling OI trends
-        rolling_oi_trends = self._calculate_rolling_oi_trends(df, selected_strikes, call_oi_column, put_oi_column, strike_column, date_column, time_column)
-        df['Rolling_Call_OI_Trend'] = rolling_oi_trends['rolling_call_trend']
-        df['Rolling_Put_OI_Trend'] = rolling_oi_trends['rolling_put_trend']
-        df['Rolling_Net_OI_Trend'] = rolling_oi_trends['rolling_net_trend']
+        # Process each timestamp
+        result_dfs = []
         
-        # Step 5: Calculate OI-Price relationship
-        oi_price_relationship = self._calculate_oi_price_relationship(df, price_column, 'Call_OI_Trend', 'Put_OI_Trend', 'Net_OI_Trend')
-        df['OI_Price_Relationship'] = oi_price_relationship['relationship']
-        df['OI_Price_Signal'] = oi_price_relationship['signal']
+        for i, timestamp in enumerate(timestamps):
+            # Get data for this timestamp
+            timestamp_data = df[df['datetime'] == timestamp].copy()
+            
+            # Identify ATM strike
+            atm_strike = self._identify_atm_strike(timestamp_data)
+            
+            # Select strikes to analyze
+            selected_strikes = self._select_strikes(timestamp_data, atm_strike)
+            
+            # Filter data for selected strikes
+            filtered_data = timestamp_data[timestamp_data['strike'].isin(selected_strikes)].copy()
+            
+            # Skip if not enough data
+            if len(filtered_data) < 2:
+                result_dfs.append(filtered_data)
+                continue
+            
+            # Calculate OI patterns
+            filtered_data = self._calculate_oi_patterns(filtered_data, i, timestamps)
+            
+            # Append to results
+            result_dfs.append(filtered_data)
         
-        # Step 6: Calculate OI-Price divergence/convergence
-        oi_price_divergence = self._calculate_oi_price_divergence(df, price_column, 'Rolling_Call_OI_Trend', 'Rolling_Put_OI_Trend', 'Rolling_Net_OI_Trend')
-        df['OI_Price_Divergence'] = oi_price_divergence['divergence']
-        df['OI_Price_Divergence_Signal'] = oi_price_divergence['signal']
+        # Combine results
+        result = pd.concat(result_dfs, ignore_index=False)
         
-        # Step 7: Calculate OI trend strength
-        oi_trend_strength = self._calculate_oi_trend_strength(df, 'Rolling_Call_OI_Trend', 'Rolling_Put_OI_Trend', 'Rolling_Net_OI_Trend')
-        df['OI_Trend_Strength'] = oi_trend_strength['strength']
-        df['OI_Trend_Strength_Signal'] = oi_trend_strength['signal']
+        # Sort by datetime and strike
+        result = result.sort_values(['datetime', 'strike'])
         
-        # Step 8: Calculate combined OI-PA signal
-        combined_signal = self._calculate_combined_signal(df, 'OI_Price_Signal', 'OI_Price_Divergence_Signal', 'OI_Trend_Strength_Signal')
-        df['OI_PA_Signal'] = combined_signal
+        # Analyze historical pattern behavior if we have enough data
+        if len(timestamps) > self.history_window:
+            result = self._analyze_historical_pattern_behavior(result)
         
-        # Step 9: Calculate OI-PA regime
-        oi_pa_regime = self._calculate_oi_pa_regime(df, 'OI_PA_Signal', 'OI_Trend_Strength', 'OI_Price_Relationship')
-        df['OI_PA_Regime'] = oi_pa_regime
+        # Analyze pattern divergence
+        result = self._analyze_pattern_divergence(result)
         
-        logger.info(f"Calculated Trending OI with PA Analysis features")
-        
-        return df
+        return result
     
-    def _identify_atm_strike(self, data, price_column, strike_column):
+    def _identify_atm_strike(self, data):
         """
         Identify ATM strike.
         
         Args:
-            data (pd.DataFrame): Input data
-            price_column (str): Column name for price
-            strike_column (str): Column name for strike price
+            data (pd.DataFrame): Data for a single timestamp
             
         Returns:
             float: ATM strike price
         """
-        # Get current price
-        current_price = data[price_column].iloc[-1]
+        # Get underlying price
+        if 'underlying_price' in data.columns:
+            underlying_price = data['underlying_price'].iloc[0]
+        else:
+            logger.warning("No underlying_price column, using mean of strikes")
+            underlying_price = data['strike'].mean()
         
         # Get unique strikes
-        unique_strikes = data[strike_column].unique()
+        unique_strikes = data['strike'].unique()
         
         # Sort strikes
         unique_strikes = np.sort(unique_strikes)
         
         # Find closest strike
-        closest_strike = unique_strikes[np.abs(unique_strikes - current_price).argmin()]
+        atm_strike = unique_strikes[np.abs(unique_strikes - underlying_price).argmin()]
         
-        return closest_strike
+        return atm_strike
     
-    def _select_strikes(self, data, atm_strike, strike_column):
+    def _select_strikes(self, data, atm_strike):
         """
         Select strikes to analyze.
         
         Args:
-            data (pd.DataFrame): Input data
+            data (pd.DataFrame): Data for a single timestamp
             atm_strike (float): ATM strike price
-            strike_column (str): Column name for strike price
             
         Returns:
             list: List of selected strikes
         """
         # Get unique strikes
-        unique_strikes = np.sort(data[strike_column].unique())
+        unique_strikes = np.sort(data['strike'].unique())
         
         # Find index of ATM strike
         atm_index = np.where(unique_strikes == atm_strike)[0][0]
@@ -215,413 +300,839 @@ class TrendingOIWithPAAnalysis:
         
         return selected_strikes
     
-    def _calculate_oi_trends(self, data, selected_strikes, call_oi_column, put_oi_column, strike_column, date_column, time_column):
+    def _calculate_oi_patterns(self, data, timestamp_index, all_timestamps):
         """
-        Calculate OI trends.
+        Calculate OI patterns for a single timestamp.
         
         Args:
-            data (pd.DataFrame): Input data
-            selected_strikes (list): List of selected strikes
-            call_oi_column (str): Column name for call open interest
-            put_oi_column (str): Column name for put open interest
-            strike_column (str): Column name for strike price
-            date_column (str): Column name for date
-            time_column (str): Column name for time
+            data (pd.DataFrame): Data for a single timestamp and selected strikes
+            timestamp_index (int): Index of current timestamp
+            all_timestamps (array): Array of all timestamps
             
         Returns:
-            dict: Dictionary with call, put, and net trend values
+            pd.DataFrame: Data with OI patterns
         """
-        # Filter data for selected strikes
-        filtered_data = data[data[strike_column].isin(selected_strikes)]
+        # Make a copy
+        df = data.copy()
         
-        # Check if date and time columns exist
-        has_datetime = date_column in data.columns and time_column in data.columns
+        # Calculate basic OI metrics
+        df = self._calculate_basic_oi_metrics(df)
         
-        # Calculate OI trends
-        if has_datetime:
-            # Group by date and time
-            grouped = filtered_data.groupby([date_column, time_column])
-            
-            # Calculate call OI trend
-            call_oi_sum = grouped[call_oi_column].sum()
-            call_oi_pct_change = call_oi_sum.pct_change()
-            
-            # Calculate put OI trend
-            put_oi_sum = grouped[put_oi_column].sum()
-            put_oi_pct_change = put_oi_sum.pct_change()
-            
-            # Calculate net OI trend
-            net_oi_sum = call_oi_sum - put_oi_sum
-            net_oi_pct_change = net_oi_sum.pct_change()
-            
-            # Reindex to match original data
-            call_trend = pd.Series(index=data.index)
-            put_trend = pd.Series(index=data.index)
-            net_trend = pd.Series(index=data.index)
-            
-            for (date, time), group in data.groupby([date_column, time_column]):
-                if (date, time) in call_oi_pct_change.index:
-                    call_trend.loc[group.index] = call_oi_pct_change.loc[(date, time)]
-                    put_trend.loc[group.index] = put_oi_pct_change.loc[(date, time)]
-                    net_trend.loc[group.index] = net_oi_pct_change.loc[(date, time)]
-        else:
-            # Calculate trends without datetime grouping
-            call_oi_sum = filtered_data.groupby(strike_column)[call_oi_column].sum()
-            put_oi_sum = filtered_data.groupby(strike_column)[put_oi_column].sum()
-            
-            # Calculate pct change
-            call_trend = call_oi_sum.pct_change().mean()
-            put_trend = put_oi_sum.pct_change().mean()
-            net_trend = (call_oi_sum - put_oi_sum).pct_change().mean()
-            
-            # Create series with same value for all rows
-            call_trend = pd.Series(call_trend, index=data.index)
-            put_trend = pd.Series(put_trend, index=data.index)
-            net_trend = pd.Series(net_trend, index=data.index)
+        # Calculate OI velocity and acceleration if we have previous timestamps
+        if timestamp_index > 0:
+            df = self._calculate_oi_velocity_acceleration(df, timestamp_index, all_timestamps)
         
-        return {
-            'call_trend': call_trend,
-            'put_trend': put_trend,
-            'net_trend': net_trend
-        }
+        # Calculate strike skew
+        df = self._calculate_strike_skew(df)
+        
+        # Calculate OI divergence from price action
+        df = self._calculate_oi_price_divergence(df)
+        
+        # Calculate time decay impact if we have expiry information
+        if 'expiry' in df.columns or 'dte' in df.columns:
+            df = self._calculate_time_decay_impact(df)
+        
+        # Calculate institutional vs. retail positioning
+        df = self._calculate_institutional_retail(df)
+        
+        # Identify OI patterns
+        df = self._identify_oi_patterns(df)
+        
+        # Calculate combined call-put patterns
+        df = self._calculate_combined_patterns(df)
+        
+        return df
     
-    def _calculate_rolling_oi_trends(self, data, selected_strikes, call_oi_column, put_oi_column, strike_column, date_column, time_column):
+    def _calculate_basic_oi_metrics(self, data):
         """
-        Calculate rolling OI trends.
+        Calculate basic OI metrics.
         
         Args:
-            data (pd.DataFrame): Input data
-            selected_strikes (list): List of selected strikes
-            call_oi_column (str): Column name for call open interest
-            put_oi_column (str): Column name for put open interest
-            strike_column (str): Column name for strike price
-            date_column (str): Column name for date
-            time_column (str): Column name for time
+            data (pd.DataFrame): Data for a single timestamp and selected strikes
             
         Returns:
-            dict: Dictionary with rolling call, put, and net trend values
+            pd.DataFrame: Data with basic OI metrics
         """
-        # Filter data for selected strikes
-        filtered_data = data[data[strike_column].isin(selected_strikes)]
+        # Make a copy
+        df = data.copy()
         
-        # Check if date and time columns exist
-        has_datetime = date_column in data.columns and time_column in data.columns
+        # Calculate call and put OI sums
+        call_oi_sum = df[df['option_type'] == 'call']['open_interest'].sum()
+        put_oi_sum = df[df['option_type'] == 'put']['open_interest'].sum()
         
-        # Calculate rolling OI trends
-        if has_datetime:
-            # Group by date and time
-            grouped = filtered_data.groupby([date_column, time_column])
-            
-            # Calculate call OI trend
-            call_oi_sum = grouped[call_oi_column].sum()
-            rolling_call_oi = call_oi_sum.rolling(window=self.short_window, min_periods=1)
-            rolling_call_oi_pct_change = (call_oi_sum - rolling_call_oi.mean()) / rolling_call_oi.mean()
-            
-            # Calculate put OI trend
-            put_oi_sum = grouped[put_oi_column].sum()
-            rolling_put_oi = put_oi_sum.rolling(window=self.short_window, min_periods=1)
-            rolling_put_oi_pct_change = (put_oi_sum - rolling_put_oi.mean()) / rolling_put_oi.mean()
-            
-            # Calculate net OI trend
-            net_oi_sum = call_oi_sum - put_oi_sum
-            rolling_net_oi = net_oi_sum.rolling(window=self.short_window, min_periods=1)
-            rolling_net_oi_pct_change = (net_oi_sum - rolling_net_oi.mean()) / rolling_net_oi.mean()
-            
-            # Reindex to match original data
-            rolling_call_trend = pd.Series(index=data.index)
-            rolling_put_trend = pd.Series(index=data.index)
-            rolling_net_trend = pd.Series(index=data.index)
-            
-            for (date, time), group in data.groupby([date_column, time_column]):
-                if (date, time) in rolling_call_oi_pct_change.index:
-                    rolling_call_trend.loc[group.index] = rolling_call_oi_pct_change.loc[(date, time)]
-                    rolling_put_trend.loc[group.index] = rolling_put_oi_pct_change.loc[(date, time)]
-                    rolling_net_trend.loc[group.index] = rolling_net_oi_pct_change.loc[(date, time)]
-        else:
-            # Calculate trends without datetime grouping
-            call_oi_sum = filtered_data.groupby(strike_column)[call_oi_column].sum()
-            put_oi_sum = filtered_data.groupby(strike_column)[put_oi_column].sum()
-            
-            # Calculate rolling means
-            rolling_call_oi = call_oi_sum.rolling(window=self.short_window, min_periods=1)
-            rolling_put_oi = put_oi_sum.rolling(window=self.short_window, min_periods=1)
-            rolling_net_oi = (call_oi_sum - put_oi_sum).rolling(window=self.short_window, min_periods=1)
-            
-            # Calculate pct change
-            rolling_call_trend = ((call_oi_sum - rolling_call_oi.mean()) / rolling_call_oi.mean()).mean()
-            rolling_put_trend = ((put_oi_sum - rolling_put_oi.mean()) / rolling_put_oi.mean()).mean()
-            rolling_net_trend = ((call_oi_sum - put_oi_sum - rolling_net_oi.mean()) / rolling_net_oi.mean()).mean()
-            
-            # Create series with same value for all rows
-            rolling_call_trend = pd.Series(rolling_call_trend, index=data.index)
-            rolling_put_trend = pd.Series(rolling_put_trend, index=data.index)
-            rolling_net_trend = pd.Series(rolling_net_trend, index=data.index)
+        # Calculate put-call ratio
+        put_call_ratio = put_oi_sum / call_oi_sum if call_oi_sum > 0 else np.nan
         
-        return {
-            'rolling_call_trend': rolling_call_trend,
-            'rolling_put_trend': rolling_put_trend,
-            'rolling_net_trend': rolling_net_trend
-        }
+        # Add to dataframe
+        df['call_oi_sum'] = call_oi_sum
+        df['put_oi_sum'] = put_oi_sum
+        df['put_call_ratio'] = put_call_ratio
+        
+        # Calculate OI by strike
+        for strike in df['strike'].unique():
+            strike_data = df[df['strike'] == strike]
+            call_oi = strike_data[strike_data['option_type'] == 'call']['open_interest'].sum()
+            put_oi = strike_data[strike_data['option_type'] == 'put']['open_interest'].sum()
+            strike_put_call_ratio = put_oi / call_oi if call_oi > 0 else np.nan
+            
+            df.loc[df['strike'] == strike, 'strike_call_oi'] = call_oi
+            df.loc[df['strike'] == strike, 'strike_put_oi'] = put_oi
+            df.loc[df['strike'] == strike, 'strike_put_call_ratio'] = strike_put_call_ratio
+        
+        return df
     
-    def _calculate_oi_price_relationship(self, data, price_column, call_trend_column, put_trend_column, net_trend_column):
+    def _calculate_oi_velocity_acceleration(self, data, timestamp_index, all_timestamps):
         """
-        Calculate OI-Price relationship.
+        Calculate OI velocity and acceleration.
         
         Args:
-            data (pd.DataFrame): Input data
-            price_column (str): Column name for price
-            call_trend_column (str): Column name for call OI trend
-            put_trend_column (str): Column name for put OI trend
-            net_trend_column (str): Column name for net OI trend
+            data (pd.DataFrame): Data for a single timestamp and selected strikes
+            timestamp_index (int): Index of current timestamp
+            all_timestamps (array): Array of all timestamps
             
         Returns:
-            dict: Dictionary with relationship and signal values
+            pd.DataFrame: Data with OI velocity and acceleration
         """
-        # Calculate price change
-        price_change = data[price_column].pct_change()
+        # Make a copy
+        df = data.copy()
         
-        # Initialize relationship and signal series
-        relationship = pd.Series(index=data.index)
-        signal = pd.Series(index=data.index)
+        # Get current timestamp
+        current_timestamp = all_timestamps[timestamp_index]
         
-        # Calculate relationship and signal for each row
-        for i in range(1, len(data)):
-            # Get values
-            price_chg = price_change.iloc[i]
-            call_trend = data[call_trend_column].iloc[i]
-            put_trend = data[put_trend_column].iloc[i]
-            net_trend = data[net_trend_column].iloc[i]
+        # Get previous timestamp
+        prev_timestamp = all_timestamps[timestamp_index - 1]
+        
+        # Get data for previous timestamp
+        prev_data = df.copy()
+        prev_data['datetime'] = prev_timestamp
+        
+        # Calculate velocity (rate of change)
+        for strike in df['strike'].unique():
+            strike_data = df[df['strike'] == strike]
             
-            # Determine relationship
-            if price_chg > self.price_increase_threshold and call_trend > self.oi_increase_threshold:
-                relationship.iloc[i] = 'Bullish_Confirmation'
-                signal.iloc[i] = 1
-            elif price_chg < self.price_decrease_threshold and put_trend > self.oi_increase_threshold:
-                relationship.iloc[i] = 'Bearish_Confirmation'
-                signal.iloc[i] = -1
-            elif price_chg > self.price_increase_threshold and put_trend > self.oi_increase_threshold:
-                relationship.iloc[i] = 'Bullish_Divergence'
-                signal.iloc[i] = 0.5
-            elif price_chg < self.price_decrease_threshold and call_trend > self.oi_increase_threshold:
-                relationship.iloc[i] = 'Bearish_Divergence'
-                signal.iloc[i] = -0.5
-            elif net_trend > self.oi_increase_threshold:
-                relationship.iloc[i] = 'Bullish_OI'
-                signal.iloc[i] = 0.25
-            elif net_trend < self.oi_decrease_threshold:
-                relationship.iloc[i] = 'Bearish_OI'
-                signal.iloc[i] = -0.25
+            # Call OI velocity
+            call_oi = strike_data[strike_data['option_type'] == 'call']['open_interest'].sum()
+            prev_call_oi = prev_data[prev_data['strike'] == strike]
+            prev_call_oi = prev_call_oi[prev_call_oi['option_type'] == 'call']['open_interest'].sum()
+            call_oi_velocity = (call_oi - prev_call_oi) / prev_call_oi if prev_call_oi > 0 else 0
+            
+            # Put OI velocity
+            put_oi = strike_data[strike_data['option_type'] == 'put']['open_interest'].sum()
+            prev_put_oi = prev_data[prev_data['strike'] == strike]
+            prev_put_oi = prev_put_oi[prev_put_oi['option_type'] == 'put']['open_interest'].sum()
+            put_oi_velocity = (put_oi - prev_put_oi) / prev_put_oi if prev_put_oi > 0 else 0
+            
+            # Update dataframe
+            df.loc[df['strike'] == strike, 'call_oi_velocity'] = call_oi_velocity
+            df.loc[df['strike'] == strike, 'put_oi_velocity'] = put_oi_velocity
+        
+        # Calculate acceleration (rate of change of velocity) if we have at least 2 previous timestamps
+        if timestamp_index > 1:
+            # Get previous previous timestamp
+            prev_prev_timestamp = all_timestamps[timestamp_index - 2]
+            
+            # Get data for previous previous timestamp
+            prev_prev_data = df.copy()
+            prev_prev_data['datetime'] = prev_prev_timestamp
+            
+            for strike in df['strike'].unique():
+                strike_data = df[df['strike'] == strike]
+                
+                # Call OI acceleration
+                call_oi_velocity = strike_data[strike_data['option_type'] == 'call']['call_oi_velocity'].iloc[0] if len(strike_data) > 0 else 0
+                prev_call_oi = prev_data[prev_data['strike'] == strike]
+                prev_call_oi_velocity = prev_call_oi[prev_call_oi['option_type'] == 'call']['call_oi_velocity'].iloc[0] if len(prev_call_oi) > 0 else 0
+                call_oi_acceleration = call_oi_velocity - prev_call_oi_velocity
+                
+                # Put OI acceleration
+                put_oi_velocity = strike_data[strike_data['option_type'] == 'put']['put_oi_velocity'].iloc[0] if len(strike_data) > 0 else 0
+                prev_put_oi = prev_data[prev_data['strike'] == strike]
+                prev_put_oi_velocity = prev_put_oi[prev_put_oi['option_type'] == 'put']['put_oi_velocity'].iloc[0] if len(prev_put_oi) > 0 else 0
+                put_oi_acceleration = put_oi_velocity - prev_put_oi_velocity
+                
+                # Update dataframe
+                df.loc[df['strike'] == strike, 'call_oi_acceleration'] = call_oi_acceleration
+                df.loc[df['strike'] == strike, 'put_oi_acceleration'] = put_oi_acceleration
+        
+        # Calculate price velocity
+        if 'underlying_price' in df.columns:
+            current_price = df['underlying_price'].iloc[0]
+            prev_price = prev_data['underlying_price'].iloc[0]
+            price_velocity = (current_price - prev_price) / prev_price if prev_price > 0 else 0
+            df['price_velocity'] = price_velocity
+        
+        return df
+    
+    def _calculate_strike_skew(self, data):
+        """
+        Calculate strike skew.
+        
+        Args:
+            data (pd.DataFrame): Data for a single timestamp and selected strikes
+            
+        Returns:
+            pd.DataFrame: Data with strike skew
+        """
+        # Make a copy
+        df = data.copy()
+        
+        # Calculate call OI skew
+        call_oi_by_strike = df[df['option_type'] == 'call'].groupby('strike')['open_interest'].sum()
+        if len(call_oi_by_strike) > 2:
+            call_oi_skew = skew(call_oi_by_strike.values)
+            call_oi_kurtosis = kurtosis(call_oi_by_strike.values)
+            df['call_oi_skew'] = call_oi_skew
+            df['call_oi_kurtosis'] = call_oi_kurtosis
+        
+        # Calculate put OI skew
+        put_oi_by_strike = df[df['option_type'] == 'put'].groupby('strike')['open_interest'].sum()
+        if len(put_oi_by_strike) > 2:
+            put_oi_skew = skew(put_oi_by_strike.values)
+            put_oi_kurtosis = kurtosis(put_oi_by_strike.values)
+            df['put_oi_skew'] = put_oi_skew
+            df['put_oi_kurtosis'] = put_oi_kurtosis
+        
+        return df
+    
+    def _calculate_oi_price_divergence(self, data):
+        """
+        Calculate OI divergence from price action.
+        
+        Args:
+            data (pd.DataFrame): Data for a single timestamp and selected strikes
+            
+        Returns:
+            pd.DataFrame: Data with OI price divergence
+        """
+        # Make a copy
+        df = data.copy()
+        
+        # Check if we have price velocity and OI velocity
+        if 'price_velocity' in df.columns and 'call_oi_velocity' in df.columns and 'put_oi_velocity' in df.columns:
+            # Get price velocity
+            price_velocity = df['price_velocity'].iloc[0]
+            
+            # Calculate call OI divergence
+            for strike in df['strike'].unique():
+                strike_data = df[df['strike'] == strike]
+                
+                # Call OI divergence
+                call_data = strike_data[strike_data['option_type'] == 'call']
+                if len(call_data) > 0:
+                    call_oi_velocity = call_data['call_oi_velocity'].iloc[0]
+                    call_oi_divergence = 1 if (price_velocity > 0 and call_oi_velocity < 0) or (price_velocity < 0 and call_oi_velocity > 0) else 0
+                    df.loc[(df['strike'] == strike) & (df['option_type'] == 'call'), 'call_oi_divergence'] = call_oi_divergence
+                
+                # Put OI divergence
+                put_data = strike_data[strike_data['option_type'] == 'put']
+                if len(put_data) > 0:
+                    put_oi_velocity = put_data['put_oi_velocity'].iloc[0]
+                    put_oi_divergence = 1 if (price_velocity > 0 and put_oi_velocity > 0) or (price_velocity < 0 and put_oi_velocity < 0) else 0
+                    df.loc[(df['strike'] == strike) & (df['option_type'] == 'put'), 'put_oi_divergence'] = put_oi_divergence
+        
+        return df
+    
+    def _calculate_time_decay_impact(self, data):
+        """
+        Calculate time decay impact on OI patterns.
+        
+        Args:
+            data (pd.DataFrame): Data for a single timestamp and selected strikes
+            
+        Returns:
+            pd.DataFrame: Data with time decay impact
+        """
+        # Make a copy
+        df = data.copy()
+        
+        # Check if we have expiry or dte information
+        if 'expiry' in df.columns:
+            # Calculate days to expiration
+            if not pd.api.types.is_datetime64_any_dtype(df['expiry']):
+                try:
+                    df['expiry'] = pd.to_datetime(df['expiry'])
+                except:
+                    logger.warning("Failed to convert expiry column to datetime format")
+                    return df
+            
+            # Calculate DTE
+            df['dte'] = (df['expiry'] - df['datetime']).dt.days
+        
+        # Adjust OI velocity based on DTE if we have DTE information
+        if 'dte' in df.columns and 'call_oi_velocity' in df.columns and 'put_oi_velocity' in df.columns:
+            # Calculate DTE factor (higher impact for shorter DTE)
+            df['dte_factor'] = 1 / (df['dte'] + 1)
+            
+            # Adjust OI velocity
+            df['call_oi_velocity_adjusted'] = df['call_oi_velocity'] * (1 - df['dte_factor'])
+            df['put_oi_velocity_adjusted'] = df['put_oi_velocity'] * (1 - df['dte_factor'])
+        
+        return df
+    
+    def _calculate_institutional_retail(self, data):
+        """
+        Calculate institutional vs. retail positioning.
+        
+        Args:
+            data (pd.DataFrame): Data for a single timestamp and selected strikes
+            
+        Returns:
+            pd.DataFrame: Data with institutional vs. retail positioning
+        """
+        # Make a copy
+        df = data.copy()
+        
+        # Check if we have lot size information
+        if 'lot_size' in df.columns:
+            # Identify institutional trades
+            df['is_institutional'] = df['lot_size'] >= self.institutional_lot_size
+            
+            # Calculate institutional OI
+            for strike in df['strike'].unique():
+                strike_data = df[df['strike'] == strike]
+                
+                # Call institutional OI
+                call_data = strike_data[(strike_data['option_type'] == 'call') & (strike_data['is_institutional'])]
+                call_institutional_oi = call_data['open_interest'].sum() if len(call_data) > 0 else 0
+                call_retail_oi = strike_data[(strike_data['option_type'] == 'call') & (~strike_data['is_institutional'])]['open_interest'].sum() if len(strike_data) > 0 else 0
+                
+                # Put institutional OI
+                put_data = strike_data[(strike_data['option_type'] == 'put') & (strike_data['is_institutional'])]
+                put_institutional_oi = put_data['open_interest'].sum() if len(put_data) > 0 else 0
+                put_retail_oi = strike_data[(strike_data['option_type'] == 'put') & (~strike_data['is_institutional'])]['open_interest'].sum() if len(strike_data) > 0 else 0
+                
+                # Update dataframe
+                df.loc[df['strike'] == strike, 'call_institutional_oi'] = call_institutional_oi
+                df.loc[df['strike'] == strike, 'call_retail_oi'] = call_retail_oi
+                df.loc[df['strike'] == strike, 'put_institutional_oi'] = put_institutional_oi
+                df.loc[df['strike'] == strike, 'put_retail_oi'] = put_retail_oi
+                
+                # Calculate institutional ratios
+                df.loc[df['strike'] == strike, 'call_institutional_ratio'] = call_institutional_oi / (call_institutional_oi + call_retail_oi) if (call_institutional_oi + call_retail_oi) > 0 else 0
+                df.loc[df['strike'] == strike, 'put_institutional_ratio'] = put_institutional_oi / (put_institutional_oi + put_retail_oi) if (put_institutional_oi + put_retail_oi) > 0 else 0
+        
+        return df
+    
+    def _identify_oi_patterns(self, data):
+        """
+        Identify OI patterns.
+        
+        Args:
+            data (pd.DataFrame): Data for a single timestamp and selected strikes
+            
+        Returns:
+            pd.DataFrame: Data with OI patterns
+        """
+        # Make a copy
+        df = data.copy()
+        
+        # Check if we have OI velocity and price velocity
+        if 'call_oi_velocity' in df.columns and 'put_oi_velocity' in df.columns and 'price_velocity' in df.columns:
+            # Initialize pattern columns
+            df['call_oi_pattern'] = 'Unknown'
+            df['put_oi_pattern'] = 'Unknown'
+            
+            # Process each strike
+            for strike in df['strike'].unique():
+                strike_data = df[df['strike'] == strike]
+                
+                # Get call data
+                call_data = strike_data[strike_data['option_type'] == 'call']
+                if len(call_data) > 0:
+                    call_oi_velocity = call_data['call_oi_velocity'].iloc[0]
+                    price_velocity = call_data['price_velocity'].iloc[0]
+                    
+                    # Identify call OI pattern
+                    if call_oi_velocity > 0 and price_velocity > 0:
+                        pattern = 'Long_Build_Up'  # OI up, price up
+                    elif call_oi_velocity < 0 and price_velocity < 0:
+                        pattern = 'Long_Unwinding'  # OI down, price down
+                    elif call_oi_velocity > 0 and price_velocity < 0:
+                        pattern = 'Short_Build_Up'  # OI up, price down
+                    elif call_oi_velocity < 0 and price_velocity > 0:
+                        pattern = 'Short_Covering'  # OI down, price up
+                    else:
+                        pattern = 'Neutral'
+                    
+                    df.loc[(df['strike'] == strike) & (df['option_type'] == 'call'), 'call_oi_pattern'] = pattern
+                
+                # Get put data
+                put_data = strike_data[strike_data['option_type'] == 'put']
+                if len(put_data) > 0:
+                    put_oi_velocity = put_data['put_oi_velocity'].iloc[0]
+                    price_velocity = put_data['price_velocity'].iloc[0]
+                    
+                    # Identify put OI pattern
+                    if put_oi_velocity > 0 and price_velocity < 0:
+                        pattern = 'Long_Build_Up'  # OI up, price down (for puts)
+                    elif put_oi_velocity < 0 and price_velocity > 0:
+                        pattern = 'Long_Unwinding'  # OI down, price up (for puts)
+                    elif put_oi_velocity > 0 and price_velocity > 0:
+                        pattern = 'Short_Build_Up'  # OI up, price up (for puts)
+                    elif put_oi_velocity < 0 and price_velocity < 0:
+                        pattern = 'Short_Covering'  # OI down, price down (for puts)
+                    else:
+                        pattern = 'Neutral'
+                    
+                    df.loc[(df['strike'] == strike) & (df['option_type'] == 'put'), 'put_oi_pattern'] = pattern
+        
+        return df
+    
+    def _calculate_combined_patterns(self, data):
+        """
+        Calculate combined call-put patterns.
+        
+        Args:
+            data (pd.DataFrame): Data for a single timestamp and selected strikes
+            
+        Returns:
+            pd.DataFrame: Data with combined patterns
+        """
+        # Make a copy
+        df = data.copy()
+        
+        # Check if we have call and put OI patterns
+        if 'call_oi_pattern' in df.columns and 'put_oi_pattern' in df.columns:
+            # Initialize combined pattern column
+            df['combined_oi_pattern'] = 'Unknown'
+            
+            # Process each strike
+            for strike in df['strike'].unique():
+                # Get call pattern
+                call_pattern = df[(df['strike'] == strike) & (df['option_type'] == 'call')]['call_oi_pattern'].iloc[0] if len(df[(df['strike'] == strike) & (df['option_type'] == 'call')]) > 0 else 'Unknown'
+                
+                # Get put pattern
+                put_pattern = df[(df['strike'] == strike) & (df['option_type'] == 'put')]['put_oi_pattern'].iloc[0] if len(df[(df['strike'] == strike) & (df['option_type'] == 'put')]) > 0 else 'Unknown'
+                
+                # Calculate combined pattern
+                combined_pattern = 'Neutral'
+                
+                # Strong bullish patterns - Corrected from option seller's perspective
+                if (call_pattern == 'Long_Build_Up' and (put_pattern == 'Short_Build_Up' or put_pattern == 'Long_Unwinding')) or \
+                   (call_pattern == 'Short_Covering' and (put_pattern == 'Short_Build_Up' or put_pattern == 'Long_Unwinding')):
+                    combined_pattern = 'Strong_Bullish'
+                
+                # Mild bullish patterns
+                elif (call_pattern == 'Long_Build_Up') or \
+                     (call_pattern == 'Short_Covering') or \
+                     (put_pattern == 'Long_Unwinding') or \
+                     (put_pattern == 'Short_Covering'):  # Put Short_Covering is bullish
+                    combined_pattern = 'Mild_Bullish'
+                
+                # Strong bearish patterns - Corrected from option seller's perspective
+                elif (put_pattern == 'Long_Build_Up' and (call_pattern == 'Short_Build_Up' or call_pattern == 'Long_Unwinding')) or \
+                     (put_pattern == 'Short_Covering' and (call_pattern == 'Short_Build_Up' or call_pattern == 'Long_Unwinding')):
+                    combined_pattern = 'Strong_Bearish'
+                
+                # Mild bearish patterns
+                elif (put_pattern == 'Long_Build_Up') or \
+                     (call_pattern == 'Long_Unwinding') or \
+                     (call_pattern == 'Short_Build_Up'):
+                    combined_pattern = 'Mild_Bearish'
+                
+                # Sideways patterns - Added for more granular classification
+                elif (call_pattern == 'Neutral' and put_pattern == 'Neutral') or \
+                     (abs(call_oi_velocity) < self.oi_increase_threshold and abs(put_oi_velocity) < self.oi_increase_threshold):
+                    combined_pattern = 'Sideways'
+                
+                # Sideways to bullish patterns
+                elif (call_pattern == 'Neutral' and (put_pattern == 'Short_Build_Up' or put_pattern == 'Long_Unwinding')) or \
+                     (put_pattern == 'Neutral' and (call_pattern == 'Long_Build_Up' or call_pattern == 'Short_Covering')):
+                    combined_pattern = 'Sideways_To_Bullish'
+                
+                # Sideways to bearish patterns
+                elif (call_pattern == 'Neutral' and (put_pattern == 'Long_Build_Up' or put_pattern == 'Short_Covering')) or \
+                     (put_pattern == 'Neutral' and (call_pattern == 'Short_Build_Up' or call_pattern == 'Long_Unwinding')):
+                    combined_pattern = 'Sideways_To_Bearish'
+                
+                # Update dataframe
+                df.loc[df['strike'] == strike, 'combined_oi_pattern'] = combined_pattern
+            
+            # Calculate overall pattern
+            pattern_counts = df['combined_oi_pattern'].value_counts()
+            
+            # Determine the dominant pattern
+            if 'Strong_Bullish' in pattern_counts and pattern_counts['Strong_Bullish'] >= 3:
+                df['overall_oi_pattern'] = 'Strong_Bullish'
+            elif 'Strong_Bearish' in pattern_counts and pattern_counts['Strong_Bearish'] >= 3:
+                df['overall_oi_pattern'] = 'Strong_Bearish'
+            elif 'Mild_Bullish' in pattern_counts and pattern_counts['Mild_Bullish'] >= 3:
+                df['overall_oi_pattern'] = 'Mild_Bullish'
+            elif 'Mild_Bearish' in pattern_counts and pattern_counts['Mild_Bearish'] >= 3:
+                df['overall_oi_pattern'] = 'Mild_Bearish'
+            elif 'Sideways' in pattern_counts and pattern_counts['Sideways'] >= 3:
+                df['overall_oi_pattern'] = 'Sideways'
+            elif 'Sideways_To_Bullish' in pattern_counts and pattern_counts['Sideways_To_Bullish'] >= 3:
+                df['overall_oi_pattern'] = 'Sideways_To_Bullish'
+            elif 'Sideways_To_Bearish' in pattern_counts and pattern_counts['Sideways_To_Bearish'] >= 3:
+                df['overall_oi_pattern'] = 'Sideways_To_Bearish'
             else:
-                relationship.iloc[i] = 'Neutral'
-                signal.iloc[i] = 0
+                df['overall_oi_pattern'] = 'Neutral'
         
-        return {
-            'relationship': relationship,
-            'signal': signal
-        }
+        return df
     
-    def _calculate_oi_price_divergence(self, data, price_column, rolling_call_trend_column, rolling_put_trend_column, rolling_net_trend_column):
+    def _analyze_historical_pattern_behavior(self, data):
         """
-        Calculate OI-Price divergence/convergence.
+        Analyze historical pattern behavior.
         
         Args:
-            data (pd.DataFrame): Input data
-            price_column (str): Column name for price
-            rolling_call_trend_column (str): Column name for rolling call OI trend
-            rolling_put_trend_column (str): Column name for rolling put OI trend
-            rolling_net_trend_column (str): Column name for rolling net OI trend
+            data (pd.DataFrame): Data with OI patterns
             
         Returns:
-            dict: Dictionary with divergence and signal values
+            pd.DataFrame: Data with historical pattern behavior analysis
         """
-        # Calculate price change
-        price_change = data[price_column].pct_change()
+        # Make a copy
+        df = data.copy()
         
-        # Calculate rolling price change
-        rolling_price_change = price_change.rolling(window=self.short_window, min_periods=1).mean()
-        
-        # Initialize divergence and signal series
-        divergence = pd.Series(index=data.index)
-        signal = pd.Series(index=data.index)
-        
-        # Calculate divergence and signal for each row
-        for i in range(self.short_window, len(data)):
-            # Get values
-            price_chg = rolling_price_change.iloc[i]
-            net_trend = data[rolling_net_trend_column].iloc[i]
+        # Check if we have overall OI pattern and underlying price
+        if 'overall_oi_pattern' in df.columns and 'underlying_price' in df.columns:
+            # Get unique timestamps
+            timestamps = df['datetime'].unique()
+            timestamps = sorted(timestamps)
             
-            # Determine divergence
-            if price_chg > self.price_increase_threshold and net_trend < 0:
-                divergence.iloc[i] = 'Bearish_Divergence'
-                signal.iloc[i] = -0.75
-            elif price_chg < self.price_decrease_threshold and net_trend > 0:
-                divergence.iloc[i] = 'Bullish_Divergence'
-                signal.iloc[i] = 0.75
-            elif price_chg > self.price_increase_threshold and net_trend > 0:
-                divergence.iloc[i] = 'Bullish_Convergence'
-                signal.iloc[i] = 1
-            elif price_chg < self.price_decrease_threshold and net_trend < 0:
-                divergence.iloc[i] = 'Bearish_Convergence'
-                signal.iloc[i] = -1
-            else:
-                divergence.iloc[i] = 'Neutral'
-                signal.iloc[i] = 0
+            # Skip if not enough timestamps
+            if len(timestamps) <= self.pattern_performance_lookback:
+                logger.warning(f"Not enough timestamps for historical pattern analysis: {len(timestamps)} <= {self.pattern_performance_lookback}")
+                return df
+            
+            # Initialize pattern performance tracking
+            pattern_performance = {}
+            
+            # Process each timestamp except the last few (need future data for performance)
+            for i in range(len(timestamps) - self.pattern_performance_lookback):
+                # Get current timestamp
+                current_timestamp = timestamps[i]
+                
+                # Get current data
+                current_data = df[df['datetime'] == current_timestamp]
+                
+                # Get current pattern
+                current_pattern = current_data['overall_oi_pattern'].iloc[0] if len(current_data) > 0 else 'Unknown'
+                
+                # Skip if unknown pattern
+                if current_pattern == 'Unknown':
+                    continue
+                
+                # Get current price
+                current_price = current_data['underlying_price'].iloc[0]
+                
+                # Get future timestamp
+                future_timestamp = timestamps[i + self.pattern_performance_lookback]
+                
+                # Get future data
+                future_data = df[df['datetime'] == future_timestamp]
+                
+                # Get future price
+                future_price = future_data['underlying_price'].iloc[0] if len(future_data) > 0 else current_price
+                
+                # Calculate return
+                pattern_return = (future_price - current_price) / current_price
+                
+                # Update pattern performance
+                if current_pattern not in pattern_performance:
+                    pattern_performance[current_pattern] = {'returns': [], 'timestamps': []}
+                
+                pattern_performance[current_pattern]['returns'].append(pattern_return)
+                pattern_performance[current_pattern]['timestamps'].append(current_timestamp)
+            
+            # Calculate pattern statistics
+            for pattern, data in pattern_performance.items():
+                returns = data['returns']
+                
+                if len(returns) >= self.min_pattern_occurrences:
+                    # Calculate statistics
+                    avg_return = np.mean(returns)
+                    success_rate = np.mean([1 if (pattern.endswith('Bullish') and r > 0) or (pattern.endswith('Bearish') and r < 0) else 0 for r in returns])
+                    
+                    # Update pattern history
+                    if pattern in self.pattern_history:
+                        self.pattern_history[pattern]['occurrences'] += len(returns)
+                        self.pattern_history[pattern]['success_rate'] = (self.pattern_history[pattern]['success_rate'] * (self.pattern_history[pattern]['occurrences'] - len(returns)) + success_rate * len(returns)) / self.pattern_history[pattern]['occurrences']
+                        self.pattern_history[pattern]['avg_return'] = (self.pattern_history[pattern]['avg_return'] * (self.pattern_history[pattern]['occurrences'] - len(returns)) + avg_return * len(returns)) / self.pattern_history[pattern]['occurrences']
+                    else:
+                        self.pattern_history[pattern] = {
+                            'occurrences': len(returns),
+                            'success_rate': success_rate,
+                            'avg_return': avg_return,
+                            'avg_duration': self.pattern_performance_lookback
+                        }
+                    
+                    # Add historical performance to dataframe
+                    for timestamp in data['timestamps']:
+                        df.loc[df['datetime'] == timestamp, f'{pattern}_historical_success_rate'] = success_rate
+                        df.loc[df['datetime'] == timestamp, f'{pattern}_historical_avg_return'] = avg_return
+            
+            # Save updated pattern history
+            self._save_pattern_history()
+            
+            # Add pattern confidence based on historical performance
+            for timestamp in timestamps:
+                timestamp_data = df[df['datetime'] == timestamp]
+                pattern = timestamp_data['overall_oi_pattern'].iloc[0] if len(timestamp_data) > 0 else 'Unknown'
+                
+                if pattern in self.pattern_history and self.pattern_history[pattern]['occurrences'] >= self.min_pattern_occurrences:
+                    success_rate = self.pattern_history[pattern]['success_rate']
+                    df.loc[df['datetime'] == timestamp, 'pattern_confidence'] = success_rate
+                else:
+                    df.loc[df['datetime'] == timestamp, 'pattern_confidence'] = 0.5  # Neutral confidence if not enough history
         
-        return {
-            'divergence': divergence,
-            'signal': signal
-        }
+        return df
     
-    def _calculate_oi_trend_strength(self, data, rolling_call_trend_column, rolling_put_trend_column, rolling_net_trend_column):
+    def _analyze_pattern_divergence(self, data):
         """
-        Calculate OI trend strength.
+        Analyze pattern divergence between components.
         
         Args:
-            data (pd.DataFrame): Input data
-            rolling_call_trend_column (str): Column name for rolling call OI trend
-            rolling_put_trend_column (str): Column name for rolling put OI trend
-            rolling_net_trend_column (str): Column name for rolling net OI trend
+            data (pd.DataFrame): Data with OI patterns
             
         Returns:
-            dict: Dictionary with strength and signal values
+            pd.DataFrame: Data with pattern divergence analysis
         """
-        # Initialize strength and signal series
-        strength = pd.Series(index=data.index)
-        signal = pd.Series(index=data.index)
+        # Make a copy
+        df = data.copy()
         
-        # Calculate strength and signal for each row
-        for i in range(self.short_window, len(data)):
-            # Get values
-            call_trend = data[rolling_call_trend_column].iloc[i]
-            put_trend = data[rolling_put_trend_column].iloc[i]
-            net_trend = data[rolling_net_trend_column].iloc[i]
+        # Check if we have overall OI pattern
+        if 'overall_oi_pattern' in df.columns:
+            # Get unique timestamps
+            timestamps = df['datetime'].unique()
+            timestamps = sorted(timestamps)
             
-            # Determine strength
-            if net_trend > self.strong_trend_threshold:
-                strength.iloc[i] = 'Strong_Bullish'
-                signal.iloc[i] = 1
-            elif net_trend > self.weak_trend_threshold:
-                strength.iloc[i] = 'Weak_Bullish'
-                signal.iloc[i] = 0.5
-            elif net_trend < -self.strong_trend_threshold:
-                strength.iloc[i] = 'Strong_Bearish'
-                signal.iloc[i] = -1
-            elif net_trend < -self.weak_trend_threshold:
-                strength.iloc[i] = 'Weak_Bearish'
-                signal.iloc[i] = -0.5
-            else:
-                strength.iloc[i] = 'Neutral'
-                signal.iloc[i] = 0
+            # Skip if not enough timestamps
+            if len(timestamps) <= self.divergence_window:
+                logger.warning(f"Not enough timestamps for divergence analysis: {len(timestamps)} <= {self.divergence_window}")
+                return df
+            
+            # Initialize divergence tracking
+            divergence_tracking = {}
+            
+            # Process each timestamp
+            for i in range(len(timestamps)):
+                # Get current timestamp
+                current_timestamp = timestamps[i]
+                
+                # Get current data
+                current_data = df[df['datetime'] == current_timestamp]
+                
+                # Get current pattern
+                current_pattern = current_data['overall_oi_pattern'].iloc[0] if len(current_data) > 0 else 'Unknown'
+                
+                # Skip if unknown pattern
+                if current_pattern == 'Unknown':
+                    continue
+                
+                # Check for divergence with other components
+                if 'call_oi_skew' in current_data.columns and 'put_oi_skew' in current_data.columns:
+                    call_skew = current_data['call_oi_skew'].iloc[0]
+                    put_skew = current_data['put_oi_skew'].iloc[0]
+                    
+                    # Detect divergence between call and put skew
+                    skew_divergence = False
+                    if (current_pattern.endswith('Bullish') and call_skew < 0 and put_skew > 0) or \
+                       (current_pattern.endswith('Bearish') and call_skew > 0 and put_skew < 0):
+                        skew_divergence = True
+                    
+                    df.loc[df['datetime'] == current_timestamp, 'skew_divergence'] = skew_divergence
+                
+                # Check for divergence with institutional positioning
+                if 'call_institutional_ratio' in current_data.columns and 'put_institutional_ratio' in current_data.columns:
+                    call_inst_ratio = current_data['call_institutional_ratio'].iloc[0]
+                    put_inst_ratio = current_data['put_institutional_ratio'].iloc[0]
+                    
+                    # Detect divergence between retail and institutional positioning
+                    inst_divergence = False
+                    if (current_pattern.endswith('Bullish') and call_inst_ratio < 0.5 and put_inst_ratio > 0.5) or \
+                       (current_pattern.endswith('Bearish') and call_inst_ratio > 0.5 and put_inst_ratio < 0.5):
+                        inst_divergence = True
+                    
+                    df.loc[df['datetime'] == current_timestamp, 'institutional_divergence'] = inst_divergence
+                
+                # Check for OI velocity divergence across strikes
+                if 'call_oi_velocity' in current_data.columns and 'put_oi_velocity' in current_data.columns:
+                    # Calculate standard deviation of OI velocity across strikes
+                    call_velocity_std = current_data[current_data['option_type'] == 'call']['call_oi_velocity'].std()
+                    put_velocity_std = current_data[current_data['option_type'] == 'put']['put_oi_velocity'].std()
+                    
+                    # Detect high dispersion in OI velocity (indicating divergence across strikes)
+                    velocity_divergence = False
+                    if call_velocity_std > self.high_velocity_threshold or put_velocity_std > self.high_velocity_threshold:
+                        velocity_divergence = True
+                    
+                    df.loc[df['datetime'] == current_timestamp, 'velocity_divergence'] = velocity_divergence
+                
+                # Check for divergence between OI patterns and price action
+                if 'price_velocity' in current_data.columns:
+                    price_velocity = current_data['price_velocity'].iloc[0]
+                    
+                    # Detect divergence between OI pattern and price action
+                    price_divergence = False
+                    if (current_pattern.endswith('Bullish') and price_velocity < 0) or \
+                       (current_pattern.endswith('Bearish') and price_velocity > 0):
+                        price_divergence = True
+                    
+                    df.loc[df['datetime'] == current_timestamp, 'price_divergence'] = price_divergence
+                
+                # Calculate overall divergence score
+                divergence_score = 0
+                divergence_count = 0
+                
+                if 'skew_divergence' in df.columns:
+                    divergence_score += df.loc[df['datetime'] == current_timestamp, 'skew_divergence'].iloc[0]
+                    divergence_count += 1
+                
+                if 'institutional_divergence' in df.columns:
+                    divergence_score += df.loc[df['datetime'] == current_timestamp, 'institutional_divergence'].iloc[0]
+                    divergence_count += 1
+                
+                if 'velocity_divergence' in df.columns:
+                    divergence_score += df.loc[df['datetime'] == current_timestamp, 'velocity_divergence'].iloc[0]
+                    divergence_count += 1
+                
+                if 'price_divergence' in df.columns:
+                    divergence_score += df.loc[df['datetime'] == current_timestamp, 'price_divergence'].iloc[0]
+                    divergence_count += 1
+                
+                if divergence_count > 0:
+                    df.loc[df['datetime'] == current_timestamp, 'divergence_score'] = divergence_score / divergence_count
+                else:
+                    df.loc[df['datetime'] == current_timestamp, 'divergence_score'] = 0
+                
+                # Adjust pattern confidence based on divergence
+                if 'pattern_confidence' in df.columns:
+                    pattern_confidence = df.loc[df['datetime'] == current_timestamp, 'pattern_confidence'].iloc[0]
+                    divergence_score = df.loc[df['datetime'] == current_timestamp, 'divergence_score'].iloc[0]
+                    
+                    # Reduce confidence if high divergence
+                    if divergence_score > self.divergence_threshold:
+                        adjusted_confidence = pattern_confidence * (1 - divergence_score)
+                        df.loc[df['datetime'] == current_timestamp, 'adjusted_pattern_confidence'] = adjusted_confidence
+                    else:
+                        df.loc[df['datetime'] == current_timestamp, 'adjusted_pattern_confidence'] = pattern_confidence
         
-        return {
-            'strength': strength,
-            'signal': signal
-        }
+        return df
     
-    def _calculate_combined_signal(self, data, oi_price_signal_column, oi_price_divergence_signal_column, oi_trend_strength_signal_column):
+    def visualize_oi_patterns(self, data, output_dir):
         """
-        Calculate combined OI-PA signal.
+        Visualize OI patterns.
         
         Args:
-            data (pd.DataFrame): Input data
-            oi_price_signal_column (str): Column name for OI-Price signal
-            oi_price_divergence_signal_column (str): Column name for OI-Price divergence signal
-            oi_trend_strength_signal_column (str): Column name for OI trend strength signal
+            data (pd.DataFrame): Data with OI patterns
+            output_dir (str): Output directory for visualizations
+        """
+        try:
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            import os
             
+            # Create output directory if it doesn't exist
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Check if we have the required columns
+            if 'strike' in data.columns and 'call_oi_pattern' in data.columns and 'put_oi_pattern' in data.columns:
+                # Get unique timestamps
+                timestamps = data['datetime'].unique()
+                
+                # Process each timestamp
+                for timestamp in timestamps:
+                    # Get data for this timestamp
+                    timestamp_data = data[data['datetime'] == timestamp].copy()
+                    
+                    # Create a figure with subplots
+                    fig, axes = plt.subplots(2, 1, figsize=(12, 10))
+                    
+                    # Plot call OI patterns
+                    call_data = timestamp_data[timestamp_data['option_type'] == 'call'].sort_values('strike')
+                    sns.barplot(x='strike', y='open_interest', hue='call_oi_pattern', data=call_data, ax=axes[0])
+                    axes[0].set_title(f'Call OI Patterns at {timestamp}')
+                    axes[0].set_xlabel('Strike')
+                    axes[0].set_ylabel('Open Interest')
+                    axes[0].tick_params(axis='x', rotation=45)
+                    
+                    # Plot put OI patterns
+                    put_data = timestamp_data[timestamp_data['option_type'] == 'put'].sort_values('strike')
+                    sns.barplot(x='strike', y='open_interest', hue='put_oi_pattern', data=put_data, ax=axes[1])
+                    axes[1].set_title(f'Put OI Patterns at {timestamp}')
+                    axes[1].set_xlabel('Strike')
+                    axes[1].set_ylabel('Open Interest')
+                    axes[1].tick_params(axis='x', rotation=45)
+                    
+                    # Adjust layout
+                    plt.tight_layout()
+                    
+                    # Save figure
+                    timestamp_str = str(timestamp).replace(':', '-').replace(' ', '_')
+                    plt.savefig(os.path.join(output_dir, f'oi_patterns_{timestamp_str}.png'))
+                    plt.close()
+                
+                # Plot overall patterns over time
+                if 'overall_oi_pattern' in data.columns:
+                    plt.figure(figsize=(12, 6))
+                    pattern_counts = data.groupby(['datetime', 'overall_oi_pattern']).size().unstack().fillna(0)
+                    pattern_counts.plot(kind='bar', stacked=True)
+                    plt.title('Overall OI Patterns Over Time')
+                    plt.xlabel('Timestamp')
+                    plt.ylabel('Count')
+                    plt.legend(title='Pattern')
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(output_dir, 'overall_oi_patterns.png'))
+                    plt.close()
+                
+                # Plot historical pattern performance if available
+                if 'pattern_confidence' in data.columns:
+                    plt.figure(figsize=(12, 6))
+                    data.groupby('datetime')['pattern_confidence'].mean().plot()
+                    plt.title('Pattern Confidence Over Time')
+                    plt.xlabel('Timestamp')
+                    plt.ylabel('Confidence')
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(output_dir, 'pattern_confidence.png'))
+                    plt.close()
+                
+                # Plot divergence score if available
+                if 'divergence_score' in data.columns:
+                    plt.figure(figsize=(12, 6))
+                    data.groupby('datetime')['divergence_score'].mean().plot()
+                    plt.title('Component Divergence Score Over Time')
+                    plt.xlabel('Timestamp')
+                    plt.ylabel('Divergence Score')
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(output_dir, 'divergence_score.png'))
+                    plt.close()
+                
+                # Plot divergence types if available
+                divergence_types = ['skew_divergence', 'institutional_divergence', 'velocity_divergence', 'price_divergence']
+                available_types = [col for col in divergence_types if col in data.columns]
+                
+                if available_types:
+                    plt.figure(figsize=(12, 6))
+                    for div_type in available_types:
+                        data.groupby('datetime')[div_type].mean().plot(label=div_type)
+                    plt.title('Divergence Types Over Time')
+                    plt.xlabel('Timestamp')
+                    plt.ylabel('Divergence (0=None, 1=Divergent)')
+                    plt.legend()
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(output_dir, 'divergence_types.png'))
+                    plt.close()
+            
+            logger.info(f"Saved OI pattern visualizations to {output_dir}")
+        
+        except Exception as e:
+            logger.error(f"Error visualizing OI patterns: {str(e)}")
+    
+    def get_pattern_history_stats(self):
+        """
+        Get pattern history statistics.
+        
         Returns:
-            pd.Series: Combined signal
+            dict: Pattern history statistics
         """
-        # Initialize combined signal series
-        combined_signal = pd.Series(index=data.index)
-        
-        # Calculate combined signal for each row
-        for i in range(self.short_window, len(data)):
-            # Get values
-            oi_price_signal = data[oi_price_signal_column].iloc[i]
-            oi_price_divergence_signal = data[oi_price_divergence_signal_column].iloc[i]
-            oi_trend_strength_signal = data[oi_trend_strength_signal_column].iloc[i]
-            
-            # Calculate weighted average
-            combined_signal.iloc[i] = (
-                oi_price_signal * 0.4 +
-                oi_price_divergence_signal * 0.3 +
-                oi_trend_strength_signal * 0.3
-            )
-        
-        return combined_signal
+        return self.pattern_history
     
-    def _calculate_oi_pa_regime(self, data, combined_signal_column, oi_trend_strength_column, oi_price_relationship_column):
+    def get_weight(self):
         """
-        Calculate OI-PA regime.
+        Get weight for market regime classification.
         
-        Args:
-            data (pd.DataFrame): Input data
-            combined_signal_column (str): Column name for combined signal
-            oi_trend_strength_column (str): Column name for OI trend strength
-            oi_price_relationship_column (str): Column name for OI-Price relationship
-            
         Returns:
-            pd.Series: OI-PA regime
+            float: Weight
         """
-        # Initialize regime series
-        regime = pd.Series(index=data.index)
-        
-        # Calculate regime for each row
-        for i in range(self.short_window, len(data)):
-            # Get values
-            combined_signal = data[combined_signal_column].iloc[i]
-            oi_trend_strength = data[oi_trend_strength_column].iloc[i]
-            oi_price_relationship = data[oi_price_relationship_column].iloc[i]
-            
-            # Determine regime
-            if combined_signal > 0.75:
-                regime.iloc[i] = 'Strong_Bullish'
-            elif combined_signal > 0.25:
-                regime.iloc[i] = 'Mild_Bullish'
-            elif combined_signal < -0.75:
-                regime.iloc[i] = 'Strong_Bearish'
-            elif combined_signal < -0.25:
-                regime.iloc[i] = 'Mild_Bearish'
-            else:
-                regime.iloc[i] = 'Neutral'
-            
-            # Add confirmation if available
-            if pd.notna(oi_trend_strength) and pd.notna(oi_price_relationship):
-                if 'Bullish' in regime.iloc[i] and ('Bullish' in oi_trend_strength or 'Bullish' in oi_price_relationship):
-                    regime.iloc[i] += '_Confirmed'
-                elif 'Bearish' in regime.iloc[i] and ('Bearish' in oi_trend_strength or 'Bearish' in oi_price_relationship):
-                    regime.iloc[i] += '_Confirmed'
-        
-        return regime
-
-# Function to calculate trending OI with PA (for backward compatibility)
-def calculate_trending_oi_pa(market_data, config=None):
-    """
-    Calculate trending OI with PA based on market data.
-    
-    Args:
-        market_data (DataFrame): Market data
-        config (dict): Configuration settings
-        
-    Returns:
-        Series: Trending OI with PA values
-    """
-    logger.info("Calculating trending OI with PA")
-    
-    try:
-        # Create trending OI with PA calculator
-        calculator = TrendingOIWithPAAnalysis(config)
-        
-        # Calculate trending OI with PA features
-        result_df = calculator.calculate_features(market_data)
-        
-        # Return trending OI with PA series
-        if 'OI_PA_Regime' in result_df.columns:
-            return result_df['OI_PA_Regime']
-        else:
-            logger.warning("OI_PA_Regime column not found in result")
-            return None
-    
-    except Exception as e:
-        logger.error(f"Error calculating trending OI with PA: {str(e)}")
-        return None
+        return self.default_weight
