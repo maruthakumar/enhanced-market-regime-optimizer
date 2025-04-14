@@ -2,15 +2,16 @@
 Consolidated Greek Sentiment Analysis Module
 
 This module implements Greek sentiment analysis for options trading,
-focusing on tracking Vega, Delta, and Theta changes across strikes in real-time
-to build a dynamic sentiment gauge.
+focusing on tracking aggregate opening values for Vega, Delta, and Theta
+and calculating minute-to-minute changes to build a dynamic sentiment gauge.
 
 Features:
-- Real-time tracking of Greeks changes
-- Strike/expiry universe definition (delta range 0.5 to 0.01)
-- Near expiry (70% weight) and next expiry (30% weight) calculations
+- Real-time tracking of Greeks changes from opening values
+- Aggregate opening values as baseline reference points
 - Minute-to-minute changes calculation
 - Aggregation of changes for calls vs. puts
+- Weighted sentiment score calculation
+- Dynamic weight adjustment based on historical performance
 - Threshold-based sentiment classification
 - DTE-specific calculations
 """
@@ -19,6 +20,7 @@ import pandas as pd
 import numpy as np
 import logging
 from datetime import datetime, timedelta
+from scipy.optimize import minimize
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -28,11 +30,11 @@ class GreekSentimentAnalysis:
     Consolidated Greek Sentiment Analysis.
     
     This class implements Greek sentiment analysis for options trading,
-    focusing on tracking Vega, Delta, and Theta changes across strikes in real-time
-    to build a dynamic sentiment gauge.
+    focusing on tracking aggregate opening values for Vega, Delta, and Theta
+    and calculating minute-to-minute changes to build a dynamic sentiment gauge.
     
-    Implementation follows specifications in Greek_sentiment.md with delta range
-    from 0.5 to 0.01 and expiry weightage: 70% for near expiry and 30% for next expiry.
+    Implementation follows specifications in Greek_sentiment.md with aggregate
+    opening values as baseline reference points and dynamic weight adjustment.
     """
     
     def __init__(self, config=None):
@@ -51,723 +53,620 @@ class GreekSentimentAnalysis:
             'next': float(self.config.get('next_expiry_weight', 0.30))
         }
         
-        # Delta range for analysis
-        self.delta_range = {
-            'call': {
-                'min': float(self.config.get('call_delta_min', 0.01)),
-                'max': float(self.config.get('call_delta_max', 0.50))
-            },
-            'put': {
-                'min': float(self.config.get('put_delta_min', -0.50)),
-                'max': float(self.config.get('put_delta_max', -0.01))
-            }
-        }
-        
         # Default weight in market regime classification (40%)
         self.default_weight = float(self.config.get('default_weight', 0.40))
         
-        # Greek component weights
-        self.greek_weights = {
-            'vega': float(self.config.get('vega_weight', 0.40)),
-            'delta': float(self.config.get('delta_weight', 0.40)),
-            'theta': float(self.config.get('theta_weight', 0.20))
-        }
+        # Greek component weights - these will be dynamically adjusted
+        self.vega_weight = float(self.config.get('vega_weight', 0.50))
+        self.delta_weight = float(self.config.get('delta_weight', 0.40))
+        self.theta_weight = float(self.config.get('theta_weight', 0.10))
         
-        # Strike category weights
-        self.strike_weights = {
-            'atm': float(self.config.get('atm_strike_weight', 0.40)),
-            'near_otm': float(self.config.get('near_otm_strike_weight', 0.30)),
-            'mid_otm': float(self.config.get('mid_otm_strike_weight', 0.20)),
-            'far_otm': float(self.config.get('far_otm_strike_weight', 0.10))
-        }
-        
-        # Sentiment thresholds
+        # Sentiment thresholds - these will be dynamically adjusted
         self.sentiment_thresholds = {
             'strong_bullish': float(self.config.get('strong_bullish_threshold', 0.5)),
-            'mild_bullish': float(self.config.get('mild_bullish_threshold', 0.1)),
-            'mild_bearish': float(self.config.get('mild_bearish_threshold', -0.1)),
+            'mild_bullish': float(self.config.get('mild_bullish_threshold', 0.2)),
+            'neutral_upper': float(self.config.get('neutral_upper_threshold', 0.1)),
+            'neutral_lower': float(self.config.get('neutral_lower_threshold', -0.1)),
+            'mild_bearish': float(self.config.get('mild_bearish_threshold', -0.2)),
             'strong_bearish': float(self.config.get('strong_bearish_threshold', -0.5))
+        }
+        
+        # Dynamic weight adjustment parameters
+        self.use_dynamic_weights = bool(self.config.get('use_dynamic_weights', True))
+        self.learning_rate = float(self.config.get('learning_rate', 0.1))
+        self.window_size = int(self.config.get('window_size', 30))
+        
+        # Weight history for tracking
+        self.weight_history = {
+            'vega_weight': [self.vega_weight],
+            'delta_weight': [self.delta_weight],
+            'theta_weight': [self.theta_weight]
+        }
+        
+        # Performance metrics history
+        self.performance_history = {
+            'accuracy': [],
+            'precision': [],
+            'recall': [],
+            'f1': []
         }
         
         logger.info(f"Initialized Greek Sentiment Analysis with default weight {self.default_weight}")
         logger.info(f"Using expiry weights: near={self.expiry_weights['near']}, next={self.expiry_weights['next']}")
-        logger.info(f"Using delta range: call={self.delta_range['call']}, put={self.delta_range['put']}")
+        logger.info(f"Initial Greek weights: vega={self.vega_weight}, delta={self.delta_weight}, theta={self.theta_weight}")
+        logger.info(f"Dynamic weight adjustment: {self.use_dynamic_weights}")
     
-    def calculate_features(self, data_frame, **kwargs):
+    def analyze_greek_sentiment(self, data):
         """
-        Calculate Greek Sentiment Analysis features.
+        Analyze Greek sentiment from options data.
         
         Args:
-            data_frame (pd.DataFrame): Input data
-            **kwargs: Additional arguments
-                - price_column (str): Column name for price
-                - call_vega_column (str): Column name for call vega
-                - put_vega_column (str): Column name for put vega
-                - call_delta_column (str): Column name for call delta
-                - put_delta_column (str): Column name for put delta
-                - call_theta_column (str): Column name for call theta
-                - put_theta_column (str): Column name for put theta
-                - strike_column (str): Column name for strike price
-                - date_column (str): Column name for date
-                - time_column (str): Column name for time
-                - expiry_column (str): Column name for expiry date
-                - dte_column (str): Column name for DTE
-                - specific_dte (int): Specific DTE to use for calculations
+            data (pd.DataFrame): Options data with Greeks
             
         Returns:
-            pd.DataFrame: Data with calculated Greek Sentiment Analysis features
+            pd.DataFrame: Data with Greek sentiment analysis
         """
         # Make a copy to avoid modifying the original
-        df = data_frame.copy()
-        
-        # Get column names from kwargs or use defaults
-        price_column = kwargs.get('price_column', 'Close')
-        call_vega_column = kwargs.get('call_vega_column', 'Call_Vega')
-        put_vega_column = kwargs.get('put_vega_column', 'Put_Vega')
-        call_delta_column = kwargs.get('call_delta_column', 'Call_Delta')
-        put_delta_column = kwargs.get('put_delta_column', 'Put_Delta')
-        call_theta_column = kwargs.get('call_theta_column', 'Call_Theta')
-        put_theta_column = kwargs.get('put_theta_column', 'Put_Theta')
-        strike_column = kwargs.get('strike_column', 'Strike')
-        date_column = kwargs.get('date_column', 'Date')
-        time_column = kwargs.get('time_column', 'Time')
-        expiry_column = kwargs.get('expiry_column', 'Expiry')
-        dte_column = kwargs.get('dte_column', 'DTE')
+        df = data.copy()
         
         # Check if required columns exist
-        required_columns = [
-            price_column, call_vega_column, put_vega_column,
-            call_delta_column, put_delta_column, call_theta_column,
-            put_theta_column, strike_column
-        ]
+        required_columns = ['datetime', 'option_type', 'delta', 'vega', 'theta']
         missing_columns = [col for col in required_columns if col not in df.columns]
         
         if missing_columns:
-            logger.warning(f"Missing required columns: {missing_columns}")
-            return df
-        
-        # Filter by delta range
-        df_calls = df[(df[call_delta_column] >= self.delta_range['call']['min']) & 
-                      (df[call_delta_column] <= self.delta_range['call']['max'])]
-        
-        df_puts = df[(df[put_delta_column] >= self.delta_range['put']['min']) & 
-                     (df[put_delta_column] <= self.delta_range['put']['max'])]
-        
-        logger.info(f"Filtered {len(df_calls)} call options and {len(df_puts)} put options by delta range")
-        
-        # Process by expiry if expiry column exists
-        if expiry_column in df.columns:
-            # Get unique expiry dates
-            expiry_dates = sorted(df[expiry_column].unique())
+            # Try to find alternative column names
+            column_mapping = {
+                'datetime': ['timestamp', 'date_time', 'time'],
+                'option_type': ['type', 'call_put', 'cp'],
+                'delta': ['Delta', 'DELTA', 'delta_value'],
+                'vega': ['Vega', 'VEGA', 'vega_value'],
+                'theta': ['Theta', 'THETA', 'theta_value']
+            }
             
-            if len(expiry_dates) >= 2:
-                # Get near and next expiry
-                near_expiry = expiry_dates[0]
-                next_expiry = expiry_dates[1]
-                
-                logger.info(f"Processing near expiry: {near_expiry} and next expiry: {next_expiry}")
-                
-                # Calculate features for near expiry
-                near_expiry_data = df[df[expiry_column] == near_expiry]
-                near_features = self._calculate_expiry_features(
-                    near_expiry_data,
-                    price_column,
-                    call_vega_column,
-                    put_vega_column,
-                    call_delta_column,
-                    put_delta_column,
-                    call_theta_column,
-                    put_theta_column,
-                    strike_column,
-                    date_column,
-                    time_column
-                )
-                
-                # Calculate features for next expiry
-                next_expiry_data = df[df[expiry_column] == next_expiry]
-                next_features = self._calculate_expiry_features(
-                    next_expiry_data,
-                    price_column,
-                    call_vega_column,
-                    put_vega_column,
-                    call_delta_column,
-                    put_delta_column,
-                    call_theta_column,
-                    put_theta_column,
-                    strike_column,
-                    date_column,
-                    time_column
-                )
-                
-                # Combine features with expiry weights
-                combined_features = {}
-                
-                for key in near_features:
-                    if key in next_features:
-                        combined_features[key] = (
-                            near_features[key] * self.expiry_weights['near'] +
-                            next_features[key] * self.expiry_weights['next']
-                        )
-                    else:
-                        combined_features[key] = near_features[key]
-                
-                # Add combined features to dataframe
-                for col, values in combined_features.items():
-                    df[col] = values
-                
-                logger.info(f"Combined features from near and next expiry with weights {self.expiry_weights}")
-            else:
-                # Process single expiry
-                logger.info(f"Processing single expiry: {expiry_dates[0] if expiry_dates else 'unknown'}")
-                
-                expiry_features = self._calculate_expiry_features(
-                    df,
-                    price_column,
-                    call_vega_column,
-                    put_vega_column,
-                    call_delta_column,
-                    put_delta_column,
-                    call_theta_column,
-                    put_theta_column,
-                    strike_column,
-                    date_column,
-                    time_column
-                )
-                
-                # Add features to dataframe
-                for col, values in expiry_features.items():
-                    df[col] = values
-        else:
-            # Process without expiry information
-            logger.info("Processing without expiry information")
+            for missing_col in missing_columns:
+                for alt_col in column_mapping.get(missing_col, []):
+                    if alt_col in df.columns:
+                        df[missing_col] = df[alt_col]
+                        logger.info(f"Using {alt_col} as {missing_col}")
+                        break
             
-            expiry_features = self._calculate_expiry_features(
-                df,
-                price_column,
-                call_vega_column,
-                put_vega_column,
-                call_delta_column,
-                put_delta_column,
-                call_theta_column,
-                put_theta_column,
-                strike_column,
-                date_column,
-                time_column
-            )
+            # Check again after mapping
+            missing_columns = [col for col in required_columns if col not in df.columns]
             
-            # Add features to dataframe
-            for col, values in expiry_features.items():
-                df[col] = values
+            if missing_columns:
+                logger.warning(f"Missing required columns after mapping: {missing_columns}")
+                return df
         
-        logger.info(f"Calculated Greek Sentiment Analysis features")
+        # Ensure datetime is in datetime format
+        if not pd.api.types.is_datetime64_any_dtype(df['datetime']):
+            try:
+                df['datetime'] = pd.to_datetime(df['datetime'])
+            except:
+                logger.warning("Failed to convert datetime column to datetime format")
+                return df
+        
+        # Sort by datetime
+        df = df.sort_values('datetime')
+        
+        # Get unique dates
+        dates = df['datetime'].dt.date.unique()
+        
+        # Process each date separately
+        result_dfs = []
+        
+        for date in dates:
+            # Get data for this date
+            date_df = df[df['datetime'].dt.date == date].copy()
+            
+            # Process this date
+            date_result = self._process_date(date_df)
+            
+            # Append to results
+            result_dfs.append(date_result)
+        
+        # Combine results
+        result = pd.concat(result_dfs, ignore_index=False)
+        
+        # Sort by datetime
+        result = result.sort_values('datetime')
+        
+        return result
+    
+    def _process_date(self, date_df):
+        """
+        Process data for a single date.
+        
+        Args:
+            date_df (pd.DataFrame): Data for a single date
+            
+        Returns:
+            pd.DataFrame: Processed data with Greek sentiment
+        """
+        # Make a copy
+        df = date_df.copy()
+        
+        # Get opening values for Greeks
+        opening_values = self._get_opening_values(df)
+        
+        # Calculate minute-to-minute changes
+        df = self._calculate_minute_changes(df, opening_values)
+        
+        # Calculate sentiment components
+        df = self._calculate_sentiment_components(df)
+        
+        # Calculate sentiment score
+        df = self._calculate_sentiment_score(df)
+        
+        # Classify sentiment
+        df = self._classify_sentiment(df)
+        
+        # If dynamic weights are enabled and we have actual regime data
+        if self.use_dynamic_weights and 'actual_regime' in df.columns:
+            # Update weights based on performance
+            df = self._update_weights(df)
         
         return df
     
-    def _calculate_expiry_features(self, expiry_data, price_column, 
-                                  call_vega_column, put_vega_column,
-                                  call_delta_column, put_delta_column,
-                                  call_theta_column, put_theta_column,
-                                  strike_column, date_column, time_column):
+    def _get_opening_values(self, df):
         """
-        Calculate Greek sentiment features for a specific expiry.
+        Get opening values for Greeks.
         
         Args:
-            expiry_data (pd.DataFrame): Data for this expiry
-            price_column (str): Column name for price
-            call_vega_column (str): Column name for call vega
-            put_vega_column (str): Column name for put vega
-            call_delta_column (str): Column name for call delta
-            put_delta_column (str): Column name for put delta
-            call_theta_column (str): Column name for call theta
-            put_theta_column (str): Column name for put theta
-            strike_column (str): Column name for strike price
-            date_column (str): Column name for date
-            time_column (str): Column name for time
+            df (pd.DataFrame): Data for a single date
             
         Returns:
-            dict: Dictionary of feature columns and values
+            dict: Opening values for Greeks
         """
-        features = {}
+        # Get the first timestamp
+        first_timestamp = df['datetime'].min()
         
-        # Step 1: Identify ATM strike
-        atm_strikes = self._identify_atm_strikes(expiry_data, price_column, strike_column)
+        # Get data for the first timestamp
+        opening_data = df[df['datetime'] == first_timestamp]
         
-        # Step 2: Select strikes to analyze
-        selected_strikes = self._select_strikes(expiry_data, atm_strikes, strike_column)
-        
-        # Step 3: Calculate Vega changes
-        vega_changes = self._calculate_vega_changes(expiry_data, selected_strikes, call_vega_column, put_vega_column, strike_column, date_column, time_column)
-        features['Vega_Change_Call'] = vega_changes['call']
-        features['Vega_Change_Put'] = vega_changes['put']
-        features['Vega_Sentiment'] = vega_changes['sentiment']
-        
-        # Step 4: Calculate Delta changes
-        delta_changes = self._calculate_delta_changes(expiry_data, selected_strikes, call_delta_column, put_delta_column, strike_column, date_column, time_column)
-        features['Delta_Change_Call'] = delta_changes['call']
-        features['Delta_Change_Put'] = delta_changes['put']
-        features['Delta_Sentiment'] = delta_changes['sentiment']
-        
-        # Step 5: Calculate Theta changes
-        theta_changes = self._calculate_theta_changes(expiry_data, selected_strikes, call_theta_column, put_theta_column, strike_column, date_column, time_column)
-        features['Theta_Change_Call'] = theta_changes['call']
-        features['Theta_Change_Put'] = theta_changes['put']
-        features['Theta_Sentiment'] = theta_changes['sentiment']
-        
-        # Step 6: Calculate combined Greek sentiment
-        greek_sentiment = self._calculate_greek_sentiment(vega_changes['sentiment'], delta_changes['sentiment'], theta_changes['sentiment'])
-        features['Greek_Sentiment_Signal'] = greek_sentiment
-        
-        # Step 7: Classify sentiment
-        sentiment = self._classify_sentiment(greek_sentiment)
-        features['Greek_Sentiment'] = sentiment
-        
-        # Step 8: Calculate Greek sentiment regime
-        regime = self._calculate_greek_sentiment_regime(sentiment, vega_changes['sentiment'], delta_changes['sentiment'])
-        features['Greek_Sentiment_Regime'] = regime
-        
-        return features
-    
-    def _identify_atm_strikes(self, data, price_column, strike_column):
-        """
-        Identify ATM strikes.
-        
-        Args:
-            data (pd.DataFrame): Input data
-            price_column (str): Column name for price
-            strike_column (str): Column name for strike price
-            
-        Returns:
-            list: List of ATM strikes
-        """
-        # Get current price
-        current_price = data[price_column].iloc[-1]
-        
-        # Get unique strikes
-        unique_strikes = data[strike_column].unique()
-        
-        # Sort strikes
-        unique_strikes = np.sort(unique_strikes)
-        
-        # Find closest strike
-        closest_strike = unique_strikes[np.abs(unique_strikes - current_price).argmin()]
-        
-        # Find strikes above and below
-        strike_above = unique_strikes[unique_strikes > closest_strike].min() if any(unique_strikes > closest_strike) else closest_strike
-        strike_below = unique_strikes[unique_strikes < closest_strike].max() if any(unique_strikes < closest_strike) else closest_strike
-        
-        # Return ATM strikes
-        return [strike_below, closest_strike, strike_above]
-    
-    def _select_strikes(self, data, atm_strikes, strike_column):
-        """
-        Select strikes to analyze.
-        
-        Args:
-            data (pd.DataFrame): Input data
-            atm_strikes (list): List of ATM strikes
-            strike_column (str): Column name for strike price
-            
-        Returns:
-            dict: Dictionary of selected strikes by category
-        """
-        # Get unique strikes
-        unique_strikes = np.sort(data[strike_column].unique())
-        
-        # Get ATM strike
-        atm_strike = atm_strikes[1]
-        
-        # Find index of ATM strike
-        atm_index = np.where(unique_strikes == atm_strike)[0][0]
-        
-        # Determine number of strikes to select (7 above and 7 below ATM, plus ATM = 15)
-        num_above = 7
-        num_below = 7
-        
-        # Select strikes above ATM
-        strikes_above = unique_strikes[atm_index+1:atm_index+1+num_above] if atm_index+1+num_above <= len(unique_strikes) else unique_strikes[atm_index+1:]
-        
-        # Select strikes below ATM
-        strikes_below = unique_strikes[max(0, atm_index-num_below):atm_index] if atm_index-num_below >= 0 else unique_strikes[:atm_index]
-        
-        # Categorize strikes
-        selected_strikes = {
-            'atm': [atm_strike],
-            'near_otm': [],
-            'mid_otm': [],
-            'far_otm': []
+        # Calculate aggregate opening values
+        opening_values = {
+            'call_delta': opening_data[opening_data['option_type'] == 'call']['delta'].sum(),
+            'put_delta': opening_data[opening_data['option_type'] == 'put']['delta'].sum(),
+            'call_vega': opening_data[opening_data['option_type'] == 'call']['vega'].sum(),
+            'put_vega': opening_data[opening_data['option_type'] == 'put']['vega'].sum(),
+            'call_theta': opening_data[opening_data['option_type'] == 'call']['theta'].sum(),
+            'put_theta': opening_data[opening_data['option_type'] == 'put']['theta'].sum()
         }
         
-        # Add strikes above ATM
-        for i, strike in enumerate(strikes_above):
-            if i < len(strikes_above) // 3:
-                selected_strikes['near_otm'].append(strike)
-            elif i < 2 * len(strikes_above) // 3:
-                selected_strikes['mid_otm'].append(strike)
-            else:
-                selected_strikes['far_otm'].append(strike)
+        logger.info(f"Opening values: {opening_values}")
         
-        # Add strikes below ATM
-        for i, strike in enumerate(strikes_below):
-            if i >= 2 * len(strikes_below) // 3:
-                selected_strikes['near_otm'].append(strike)
-            elif i >= len(strikes_below) // 3:
-                selected_strikes['mid_otm'].append(strike)
-            else:
-                selected_strikes['far_otm'].append(strike)
-        
-        return selected_strikes
+        return opening_values
     
-    def _calculate_vega_changes(self, data, selected_strikes, call_vega_column, put_vega_column, strike_column, date_column, time_column):
+    def _calculate_minute_changes(self, df, opening_values):
         """
-        Calculate Vega changes.
+        Calculate minute-to-minute changes from opening values.
         
         Args:
-            data (pd.DataFrame): Input data
-            selected_strikes (dict): Dictionary of selected strikes by category
-            call_vega_column (str): Column name for call vega
-            put_vega_column (str): Column name for put vega
-            strike_column (str): Column name for strike price
-            date_column (str): Column name for date
-            time_column (str): Column name for time
+            df (pd.DataFrame): Data for a single date
+            opening_values (dict): Opening values for Greeks
             
         Returns:
-            dict: Dictionary with call, put, and sentiment values
+            pd.DataFrame: Data with minute changes
         """
-        # Initialize weighted Vega changes
-        weighted_call_vega_change = 0
-        weighted_put_vega_change = 0
+        # Get unique timestamps
+        timestamps = df['datetime'].unique()
         
-        # Check if date and time columns exist
-        has_datetime = date_column in data.columns and time_column in data.columns
+        # Initialize result columns
+        df['Delta_Change_Call'] = 0.0
+        df['Delta_Change_Put'] = 0.0
+        df['Vega_Change_Call'] = 0.0
+        df['Vega_Change_Put'] = 0.0
+        df['Theta_Change_Call'] = 0.0
+        df['Theta_Change_Put'] = 0.0
         
-        # Process each strike category
-        for category, strikes in selected_strikes.items():
-            # Skip if no strikes in this category
-            if not strikes:
-                continue
+        # Process each timestamp
+        for timestamp in timestamps:
+            # Get data for this timestamp
+            timestamp_data = df[df['datetime'] == timestamp]
             
-            # Get weight for this category
-            category_weight = self.strike_weights.get(category, 0.1)
+            # Calculate aggregate values for this timestamp
+            current_values = {
+                'call_delta': timestamp_data[timestamp_data['option_type'] == 'call']['delta'].sum(),
+                'put_delta': timestamp_data[timestamp_data['option_type'] == 'put']['delta'].sum(),
+                'call_vega': timestamp_data[timestamp_data['option_type'] == 'call']['vega'].sum(),
+                'put_vega': timestamp_data[timestamp_data['option_type'] == 'put']['vega'].sum(),
+                'call_theta': timestamp_data[timestamp_data['option_type'] == 'call']['theta'].sum(),
+                'put_theta': timestamp_data[timestamp_data['option_type'] == 'put']['theta'].sum()
+            }
             
-            # Filter data for these strikes
-            category_data = data[data[strike_column].isin(strikes)]
+            # Calculate changes from opening values
+            delta_change_call = current_values['call_delta'] - opening_values['call_delta']
+            delta_change_put = current_values['put_delta'] - opening_values['put_delta']
+            vega_change_call = current_values['call_vega'] - opening_values['call_vega']
+            vega_change_put = current_values['put_vega'] - opening_values['put_vega']
+            theta_change_call = current_values['call_theta'] - opening_values['call_theta']
+            theta_change_put = current_values['put_theta'] - opening_values['put_theta']
             
-            # Skip if no data for these strikes
-            if category_data.empty:
-                continue
+            # Update result columns for this timestamp
+            df.loc[df['datetime'] == timestamp, 'Delta_Change_Call'] = delta_change_call
+            df.loc[df['datetime'] == timestamp, 'Delta_Change_Put'] = delta_change_put
+            df.loc[df['datetime'] == timestamp, 'Vega_Change_Call'] = vega_change_call
+            df.loc[df['datetime'] == timestamp, 'Vega_Change_Put'] = vega_change_put
+            df.loc[df['datetime'] == timestamp, 'Theta_Change_Call'] = theta_change_call
+            df.loc[df['datetime'] == timestamp, 'Theta_Change_Put'] = theta_change_put
+        
+        return df
+    
+    def _calculate_sentiment_components(self, df):
+        """
+        Calculate sentiment components from Greek changes.
+        
+        Args:
+            df (pd.DataFrame): Data with minute changes
             
-            # Calculate Vega changes
-            if has_datetime:
-                # Group by date and time
-                grouped = category_data.groupby([date_column, time_column])
+        Returns:
+            pd.DataFrame: Data with sentiment components
+        """
+        # Get unique timestamps
+        timestamps = df['datetime'].unique()
+        
+        # Initialize result columns
+        df['Delta_Component'] = 0.0
+        df['Vega_Component'] = 0.0
+        df['Theta_Component'] = 0.0
+        
+        # Process each timestamp
+        for timestamp in timestamps:
+            # Get data for this timestamp
+            timestamp_data = df[df['datetime'] == timestamp]
+            
+            # Get the first row for this timestamp
+            first_row = timestamp_data.iloc[0]
+            
+            # Calculate Delta component
+            # Increasing call delta is bullish, increasing put delta is bearish
+            delta_component = (first_row['Delta_Change_Call'] - first_row['Delta_Change_Put']) / 100.0
+            
+            # Calculate Vega component
+            # Increasing call vega (call options being bought) is bullish
+            # Increasing put vega (put options being bought) is bearish
+            vega_component = (first_row['Vega_Change_Call'] - first_row['Vega_Change_Put']) / 100.0
+            
+            # Calculate Theta component
+            # Increasing call theta (call options being sold) is bearish
+            # Increasing put theta (put options being sold) is bullish
+            theta_component = (first_row['Theta_Change_Put'] - first_row['Theta_Change_Call']) / 100.0
+            
+            # Update result columns for this timestamp
+            df.loc[df['datetime'] == timestamp, 'Delta_Component'] = delta_component
+            df.loc[df['datetime'] == timestamp, 'Vega_Component'] = vega_component
+            df.loc[df['datetime'] == timestamp, 'Theta_Component'] = theta_component
+        
+        return df
+    
+    def _calculate_sentiment_score(self, df):
+        """
+        Calculate sentiment score from components.
+        
+        Args:
+            df (pd.DataFrame): Data with sentiment components
+            
+        Returns:
+            pd.DataFrame: Data with sentiment score
+        """
+        # Get unique timestamps
+        timestamps = df['datetime'].unique()
+        
+        # Initialize result column
+        df['Sentiment_Score'] = 0.0
+        
+        # Process each timestamp
+        for timestamp in timestamps:
+            # Get data for this timestamp
+            timestamp_data = df[df['datetime'] == timestamp]
+            
+            # Get the first row for this timestamp
+            first_row = timestamp_data.iloc[0]
+            
+            # Calculate weighted sentiment score
+            sentiment_score = (
+                self.delta_weight * first_row['Delta_Component'] +
+                self.vega_weight * first_row['Vega_Component'] +
+                self.theta_weight * first_row['Theta_Component']
+            )
+            
+            # Update result column for this timestamp
+            df.loc[df['datetime'] == timestamp, 'Sentiment_Score'] = sentiment_score
+        
+        return df
+    
+    def _classify_sentiment(self, df):
+        """
+        Classify sentiment based on score.
+        
+        Args:
+            df (pd.DataFrame): Data with sentiment score
+            
+        Returns:
+            pd.DataFrame: Data with classified sentiment
+        """
+        # Initialize result column
+        df['Greek_Sentiment'] = 'Neutral'
+        
+        # Classify sentiment
+        df.loc[df['Sentiment_Score'] > self.sentiment_thresholds['strong_bullish'], 'Greek_Sentiment'] = 'Strong_Bullish'
+        df.loc[(df['Sentiment_Score'] > self.sentiment_thresholds['mild_bullish']) & 
+               (df['Sentiment_Score'] <= self.sentiment_thresholds['strong_bullish']), 'Greek_Sentiment'] = 'Mild_Bullish'
+        df.loc[(df['Sentiment_Score'] > self.sentiment_thresholds['neutral_upper']) & 
+               (df['Sentiment_Score'] <= self.sentiment_thresholds['mild_bullish']), 'Greek_Sentiment'] = 'Sideways_To_Bullish'
+        df.loc[(df['Sentiment_Score'] > self.sentiment_thresholds['neutral_lower']) & 
+               (df['Sentiment_Score'] <= self.sentiment_thresholds['neutral_upper']), 'Greek_Sentiment'] = 'Neutral'
+        df.loc[(df['Sentiment_Score'] <= self.sentiment_thresholds['neutral_lower']) & 
+               (df['Sentiment_Score'] > self.sentiment_thresholds['mild_bearish']), 'Greek_Sentiment'] = 'Sideways_To_Bearish'
+        df.loc[(df['Sentiment_Score'] <= self.sentiment_thresholds['mild_bearish']) & 
+               (df['Sentiment_Score'] > self.sentiment_thresholds['strong_bearish']), 'Greek_Sentiment'] = 'Mild_Bearish'
+        df.loc[df['Sentiment_Score'] <= self.sentiment_thresholds['strong_bearish'], 'Greek_Sentiment'] = 'Strong_Bearish'
+        
+        # Add confidence level based on distance from thresholds
+        df['Sentiment_Confidence'] = 0.5  # Default medium confidence
+        
+        # Higher confidence for values far from thresholds
+        df.loc[df['Sentiment_Score'] > self.sentiment_thresholds['strong_bullish'] * 1.5, 'Sentiment_Confidence'] = 0.9
+        df.loc[df['Sentiment_Score'] < self.sentiment_thresholds['strong_bearish'] * 1.5, 'Sentiment_Confidence'] = 0.9
+        
+        # Lower confidence for values close to thresholds
+        threshold_margin = 0.05
+        for threshold in ['strong_bullish', 'mild_bullish', 'neutral_upper', 'neutral_lower', 'mild_bearish', 'strong_bearish']:
+            threshold_value = self.sentiment_thresholds[threshold]
+            df.loc[abs(df['Sentiment_Score'] - threshold_value) < threshold_margin, 'Sentiment_Confidence'] = 0.3
+        
+        return df
+    
+    def _update_weights(self, df):
+        """
+        Update weights based on performance.
+        
+        Args:
+            df (pd.DataFrame): Data with sentiment and actual regime
+            
+        Returns:
+            pd.DataFrame: Data with updated weights
+        """
+        # Check if we have enough data
+        if len(df) < self.window_size:
+            logger.warning(f"Not enough data for weight update: {len(df)} < {self.window_size}")
+            return df
+        
+        # Get unique timestamps
+        timestamps = df['datetime'].unique()
+        
+        # Initialize weight columns
+        df['vega_weight'] = self.vega_weight
+        df['delta_weight'] = self.delta_weight
+        df['theta_weight'] = self.theta_weight
+        
+        # Process in windows
+        for i in range(self.window_size, len(timestamps), self.window_size):
+            # Get window data
+            window_timestamps = timestamps[i-self.window_size:i]
+            window_data = df[df['datetime'].isin(window_timestamps)].copy()
+            
+            # Prepare training data
+            X = window_data[['Delta_Component', 'Vega_Component', 'Theta_Component']]
+            y = window_data['actual_regime']
+            
+            # Optimize weights
+            optimized_weights = self._optimize_weights(X, y)
+            
+            # Update weights
+            self.vega_weight = optimized_weights['vega_weight']
+            self.delta_weight = optimized_weights['delta_weight']
+            self.theta_weight = optimized_weights['theta_weight']
+            
+            # Update weight history
+            self.weight_history['vega_weight'].append(self.vega_weight)
+            self.weight_history['delta_weight'].append(self.delta_weight)
+            self.weight_history['theta_weight'].append(self.theta_weight)
+            
+            # Update weight columns for future timestamps
+            future_timestamps = timestamps[i:]
+            df.loc[df['datetime'].isin(future_timestamps), 'vega_weight'] = self.vega_weight
+            df.loc[df['datetime'].isin(future_timestamps), 'delta_weight'] = self.delta_weight
+            df.loc[df['datetime'].isin(future_timestamps), 'theta_weight'] = self.theta_weight
+            
+            # Recalculate sentiment score with new weights
+            for timestamp in future_timestamps:
+                # Get data for this timestamp
+                timestamp_data = df[df['datetime'] == timestamp]
                 
-                # Get first and last groups
-                if len(grouped) >= 2:
-                    first_group = grouped.first()
-                    last_group = grouped.last()
-                    
-                    # Calculate changes
-                    call_vega_change = (last_group[call_vega_column].mean() - first_group[call_vega_column].mean()) / first_group[call_vega_column].mean() if first_group[call_vega_column].mean() != 0 else 0
-                    put_vega_change = (last_group[put_vega_column].mean() - first_group[put_vega_column].mean()) / first_group[put_vega_column].mean() if first_group[put_vega_column].mean() != 0 else 0
-                else:
-                    call_vega_change = 0
-                    put_vega_change = 0
-            else:
-                # Calculate changes from first to last row
-                if len(category_data) >= 2:
-                    call_vega_first = category_data[call_vega_column].iloc[0]
-                    call_vega_last = category_data[call_vega_column].iloc[-1]
-                    put_vega_first = category_data[put_vega_column].iloc[0]
-                    put_vega_last = category_data[put_vega_column].iloc[-1]
-                    
-                    call_vega_change = (call_vega_last - call_vega_first) / call_vega_first if call_vega_first != 0 else 0
-                    put_vega_change = (put_vega_last - put_vega_first) / put_vega_first if put_vega_first != 0 else 0
-                else:
-                    call_vega_change = 0
-                    put_vega_change = 0
-            
-            # Add weighted changes
-            weighted_call_vega_change += call_vega_change * category_weight
-            weighted_put_vega_change += put_vega_change * category_weight
-        
-        # Calculate Vega sentiment
-        # Positive call vega change is bullish, positive put vega change is bearish
-        vega_sentiment = weighted_call_vega_change - weighted_put_vega_change
-        
-        return {
-            'call': weighted_call_vega_change,
-            'put': weighted_put_vega_change,
-            'sentiment': vega_sentiment
-        }
-    
-    def _calculate_delta_changes(self, data, selected_strikes, call_delta_column, put_delta_column, strike_column, date_column, time_column):
-        """
-        Calculate Delta changes.
-        
-        Args:
-            data (pd.DataFrame): Input data
-            selected_strikes (dict): Dictionary of selected strikes by category
-            call_delta_column (str): Column name for call delta
-            put_delta_column (str): Column name for put delta
-            strike_column (str): Column name for strike price
-            date_column (str): Column name for date
-            time_column (str): Column name for time
-            
-        Returns:
-            dict: Dictionary with call, put, and sentiment values
-        """
-        # Initialize weighted Delta changes
-        weighted_call_delta_change = 0
-        weighted_put_delta_change = 0
-        
-        # Check if date and time columns exist
-        has_datetime = date_column in data.columns and time_column in data.columns
-        
-        # Process each strike category
-        for category, strikes in selected_strikes.items():
-            # Skip if no strikes in this category
-            if not strikes:
-                continue
-            
-            # Get weight for this category
-            category_weight = self.strike_weights.get(category, 0.1)
-            
-            # Filter data for these strikes
-            category_data = data[data[strike_column].isin(strikes)]
-            
-            # Skip if no data for these strikes
-            if category_data.empty:
-                continue
-            
-            # Calculate Delta changes
-            if has_datetime:
-                # Group by date and time
-                grouped = category_data.groupby([date_column, time_column])
+                # Get the first row for this timestamp
+                first_row = timestamp_data.iloc[0]
                 
-                # Get first and last groups
-                if len(grouped) >= 2:
-                    first_group = grouped.first()
-                    last_group = grouped.last()
-                    
-                    # Calculate changes
-                    call_delta_change = (last_group[call_delta_column].mean() - first_group[call_delta_column].mean()) / first_group[call_delta_column].mean() if first_group[call_delta_column].mean() != 0 else 0
-                    put_delta_change = (last_group[put_delta_column].mean() - first_group[put_delta_column].mean()) / first_group[put_delta_column].mean() if first_group[put_delta_column].mean() != 0 else 0
-                else:
-                    call_delta_change = 0
-                    put_delta_change = 0
-            else:
-                # Calculate changes from first to last row
-                if len(category_data) >= 2:
-                    call_delta_first = category_data[call_delta_column].iloc[0]
-                    call_delta_last = category_data[call_delta_column].iloc[-1]
-                    put_delta_first = category_data[put_delta_column].iloc[0]
-                    put_delta_last = category_data[put_delta_column].iloc[-1]
-                    
-                    call_delta_change = (call_delta_last - call_delta_first) / call_delta_first if call_delta_first != 0 else 0
-                    put_delta_change = (put_delta_last - put_delta_first) / put_delta_first if put_delta_first != 0 else 0
-                else:
-                    call_delta_change = 0
-                    put_delta_change = 0
-            
-            # Add weighted changes
-            weighted_call_delta_change += call_delta_change * category_weight
-            weighted_put_delta_change += put_delta_change * category_weight
-        
-        # Calculate Delta sentiment
-        # Positive call delta change is bullish, positive put delta change is bearish
-        delta_sentiment = weighted_call_delta_change - weighted_put_delta_change
-        
-        return {
-            'call': weighted_call_delta_change,
-            'put': weighted_put_delta_change,
-            'sentiment': delta_sentiment
-        }
-    
-    def _calculate_theta_changes(self, data, selected_strikes, call_theta_column, put_theta_column, strike_column, date_column, time_column):
-        """
-        Calculate Theta changes.
-        
-        Args:
-            data (pd.DataFrame): Input data
-            selected_strikes (dict): Dictionary of selected strikes by category
-            call_theta_column (str): Column name for call theta
-            put_theta_column (str): Column name for put theta
-            strike_column (str): Column name for strike price
-            date_column (str): Column name for date
-            time_column (str): Column name for time
-            
-        Returns:
-            dict: Dictionary with call, put, and sentiment values
-        """
-        # Initialize weighted Theta changes
-        weighted_call_theta_change = 0
-        weighted_put_theta_change = 0
-        
-        # Check if date and time columns exist
-        has_datetime = date_column in data.columns and time_column in data.columns
-        
-        # Process each strike category
-        for category, strikes in selected_strikes.items():
-            # Skip if no strikes in this category
-            if not strikes:
-                continue
-            
-            # Get weight for this category
-            category_weight = self.strike_weights.get(category, 0.1)
-            
-            # Filter data for these strikes
-            category_data = data[data[strike_column].isin(strikes)]
-            
-            # Skip if no data for these strikes
-            if category_data.empty:
-                continue
-            
-            # Calculate Theta changes
-            if has_datetime:
-                # Group by date and time
-                grouped = category_data.groupby([date_column, time_column])
+                # Calculate weighted sentiment score
+                sentiment_score = (
+                    self.delta_weight * first_row['Delta_Component'] +
+                    self.vega_weight * first_row['Vega_Component'] +
+                    self.theta_weight * first_row['Theta_Component']
+                )
                 
-                # Get first and last groups
-                if len(grouped) >= 2:
-                    first_group = grouped.first()
-                    last_group = grouped.last()
-                    
-                    # Calculate changes
-                    call_theta_change = (last_group[call_theta_column].mean() - first_group[call_theta_column].mean()) / first_group[call_theta_column].mean() if first_group[call_theta_column].mean() != 0 else 0
-                    put_theta_change = (last_group[put_theta_column].mean() - first_group[put_theta_column].mean()) / first_group[put_theta_column].mean() if first_group[put_theta_column].mean() != 0 else 0
-                else:
-                    call_theta_change = 0
-                    put_theta_change = 0
-            else:
-                # Calculate changes from first to last row
-                if len(category_data) >= 2:
-                    call_theta_first = category_data[call_theta_column].iloc[0]
-                    call_theta_last = category_data[call_theta_column].iloc[-1]
-                    put_theta_first = category_data[put_theta_column].iloc[0]
-                    put_theta_last = category_data[put_theta_column].iloc[-1]
-                    
-                    call_theta_change = (call_theta_last - call_theta_first) / call_theta_first if call_theta_first != 0 else 0
-                    put_theta_change = (put_theta_last - put_theta_first) / put_theta_first if put_theta_first != 0 else 0
-                else:
-                    call_theta_change = 0
-                    put_theta_change = 0
+                # Update result column for this timestamp
+                df.loc[df['datetime'] == timestamp, 'Sentiment_Score'] = sentiment_score
             
-            # Add weighted changes
-            weighted_call_theta_change += call_theta_change * category_weight
-            weighted_put_theta_change += put_theta_change * category_weight
+            # Reclassify sentiment
+            df = self._classify_sentiment(df)
         
-        # Calculate Theta sentiment
-        # Negative call theta change is bullish, negative put theta change is bearish
-        theta_sentiment = -weighted_call_theta_change + weighted_put_theta_change
-        
-        return {
-            'call': weighted_call_theta_change,
-            'put': weighted_put_theta_change,
-            'sentiment': theta_sentiment
-        }
+        return df
     
-    def _calculate_greek_sentiment(self, vega_sentiment, delta_sentiment, theta_sentiment):
+    def _optimize_weights(self, X, y):
         """
-        Calculate combined Greek sentiment.
+        Optimize weights for Greek sentiment components.
         
         Args:
-            vega_sentiment (float): Vega sentiment
-            delta_sentiment (float): Delta sentiment
-            theta_sentiment (float): Theta sentiment
+            X (pd.DataFrame): Features (Delta_Component, Vega_Component, Theta_Component)
+            y (pd.Series): Target (actual_regime)
             
         Returns:
-            float: Combined Greek sentiment
+            dict: Optimized weights
         """
-        # Calculate weighted sentiment
-        greek_sentiment = (
-            vega_sentiment * self.greek_weights['vega'] +
-            delta_sentiment * self.greek_weights['delta'] +
-            theta_sentiment * self.greek_weights['theta']
+        # Initial weights
+        initial_weights = [self.delta_weight, self.vega_weight, self.theta_weight]
+        
+        # Bounds for weights (0 to 1)
+        bounds = [(0, 1), (0, 1), (0, 1)]
+        
+        # Constraint: sum of weights = 1
+        constraint = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
+        
+        try:
+            # Optimize weights
+            result = minimize(
+                self._objective_function,
+                initial_weights,
+                args=(X, y),
+                bounds=bounds,
+                constraints=constraint,
+                method='SLSQP'
+            )
+            
+            # Get optimized weights
+            optimized_weights = result.x
+            
+            # Normalize weights to sum to 1
+            optimized_weights = optimized_weights / np.sum(optimized_weights)
+            
+            # Create weights dictionary
+            weights = {
+                'delta_weight': optimized_weights[0],
+                'vega_weight': optimized_weights[1],
+                'theta_weight': optimized_weights[2]
+            }
+            
+            logger.info(f"Optimized weights: {weights}")
+            
+            return weights
+        
+        except Exception as e:
+            logger.error(f"Error optimizing weights: {str(e)}")
+            
+            # Return current weights
+            return {
+                'delta_weight': self.delta_weight,
+                'vega_weight': self.vega_weight,
+                'theta_weight': self.theta_weight
+            }
+    
+    def _objective_function(self, weights, X, y_true):
+        """
+        Objective function for weight optimization.
+        
+        Args:
+            weights (list): Weights for Delta, Vega, and Theta components
+            X (pd.DataFrame): Features
+            y_true (pd.Series): True labels
+            
+        Returns:
+            float: Negative accuracy (to be minimized)
+        """
+        # Normalize weights to sum to 1
+        weights = np.array(weights)
+        weights = weights / np.sum(weights)
+        
+        # Calculate weighted sentiment score
+        sentiment_score = (
+            weights[0] * X['Delta_Component'] +
+            weights[1] * X['Vega_Component'] +
+            weights[2] * X['Theta_Component']
         )
         
-        return greek_sentiment
+        # Classify sentiment
+        y_pred = pd.Series(index=y_true.index)
+        y_pred[sentiment_score > self.sentiment_thresholds['strong_bullish']] = 'Strong_Bullish'
+        y_pred[(sentiment_score > self.sentiment_thresholds['mild_bullish']) & 
+               (sentiment_score <= self.sentiment_thresholds['strong_bullish'])] = 'Mild_Bullish'
+        y_pred[(sentiment_score > self.sentiment_thresholds['neutral_lower']) & 
+               (sentiment_score <= self.sentiment_thresholds['neutral_upper'])] = 'Neutral'
+        y_pred[(sentiment_score <= self.sentiment_thresholds['mild_bearish']) & 
+               (sentiment_score > self.sentiment_thresholds['strong_bearish'])] = 'Mild_Bearish'
+        y_pred[sentiment_score <= self.sentiment_thresholds['strong_bearish']] = 'Strong_Bearish'
+        
+        # Add sideways classifications
+        y_pred[(sentiment_score > self.sentiment_thresholds['neutral_upper']) & 
+               (sentiment_score <= self.sentiment_thresholds['mild_bullish'])] = 'Sideways_To_Bullish'
+        y_pred[(sentiment_score <= self.sentiment_thresholds['neutral_lower']) & 
+               (sentiment_score > self.sentiment_thresholds['mild_bearish'])] = 'Sideways_To_Bearish'
+        
+        # Calculate accuracy
+        accuracy = np.mean(y_pred == y_true)
+        
+        # Return negative accuracy (to be minimized)
+        return -accuracy
     
-    def _classify_sentiment(self, greek_sentiment):
+    def visualize_sentiment(self, data, output_dir):
         """
-        Classify Greek sentiment.
+        Visualize Greek sentiment analysis results.
         
         Args:
-            greek_sentiment (float): Greek sentiment value
+            data (pd.DataFrame): Data with Greek sentiment analysis
+            output_dir (str): Output directory for visualizations
+        """
+        try:
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            import os
             
-        Returns:
-            str: Sentiment classification
-        """
-        if greek_sentiment >= self.sentiment_thresholds['strong_bullish']:
-            return 'Strong_Bullish'
-        elif greek_sentiment >= self.sentiment_thresholds['mild_bullish']:
-            return 'Mild_Bullish'
-        elif greek_sentiment <= self.sentiment_thresholds['strong_bearish']:
-            return 'Strong_Bearish'
-        elif greek_sentiment <= self.sentiment_thresholds['mild_bearish']:
-            return 'Mild_Bearish'
-        else:
-            return 'Neutral'
-    
-    def _calculate_greek_sentiment_regime(self, sentiment, vega_sentiment, delta_sentiment):
-        """
-        Calculate Greek sentiment regime.
-        
-        Args:
-            sentiment (str): Sentiment classification
-            vega_sentiment (float): Vega sentiment
-            delta_sentiment (float): Delta sentiment
+            # Create output directory if it doesn't exist
+            os.makedirs(output_dir, exist_ok=True)
             
-        Returns:
-            str: Greek sentiment regime
-        """
-        # Determine regime based on sentiment and confirmation
-        if sentiment == 'Strong_Bullish' and vega_sentiment > 0 and delta_sentiment > 0:
-            return 'Strong_Bullish_Confirmed'
-        elif sentiment == 'Strong_Bullish':
-            return 'Strong_Bullish_Unconfirmed'
-        elif sentiment == 'Mild_Bullish' and vega_sentiment > 0:
-            return 'Mild_Bullish_Confirmed'
-        elif sentiment == 'Mild_Bullish':
-            return 'Mild_Bullish_Unconfirmed'
-        elif sentiment == 'Strong_Bearish' and vega_sentiment < 0 and delta_sentiment < 0:
-            return 'Strong_Bearish_Confirmed'
-        elif sentiment == 'Strong_Bearish':
-            return 'Strong_Bearish_Unconfirmed'
-        elif sentiment == 'Mild_Bearish' and vega_sentiment < 0:
-            return 'Mild_Bearish_Confirmed'
-        elif sentiment == 'Mild_Bearish':
-            return 'Mild_Bearish_Unconfirmed'
-        else:
-            return 'Neutral'
-
-# Function to calculate Greek sentiment (for backward compatibility)
-def calculate_greek_sentiment(market_data, config=None):
-    """
-    Calculate Greek sentiment based on market data.
-    
-    Args:
-        market_data (DataFrame): Market data
-        config (dict): Configuration settings
+            # Sentiment distribution
+            plt.figure(figsize=(12, 6))
+            sentiment_counts = data['Greek_Sentiment'].value_counts()
+            sns.barplot(x=sentiment_counts.index, y=sentiment_counts.values)
+            plt.title('Greek Sentiment Distribution')
+            plt.xlabel('Sentiment')
+            plt.ylabel('Count')
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, 'sentiment_distribution.png'))
+            plt.close()
+            
+            # Sentiment score over time
+            plt.figure(figsize=(12, 6))
+            plt.plot(data['datetime'], data['Sentiment_Score'])
+            plt.title('Sentiment Score Over Time')
+            plt.xlabel('Time')
+            plt.ylabel('Sentiment Score')
+            plt.axhline(y=0, color='r', linestyle='-')
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, 'sentiment_score_time.png'))
+            plt.close()
+            
+            # Component contributions
+            plt.figure(figsize=(12, 6))
+            plt.plot(data['datetime'], data['Delta_Component'], label='Delta')
+            plt.plot(data['datetime'], data['Vega_Component'], label='Vega')
+            plt.plot(data['datetime'], data['Theta_Component'], label='Theta')
+            plt.title('Component Contributions Over Time')
+            plt.xlabel('Time')
+            plt.ylabel('Component Value')
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, 'component_contributions.png'))
+            plt.close()
+            
+            # If we have dynamic weights
+            if 'vega_weight' in data.columns:
+                # Weight evolution
+                plt.figure(figsize=(12, 6))
+                plt.plot(data['datetime'], data['vega_weight'], label='Vega Weight')
+                plt.plot(data['datetime'], data['delta_weight'], label='Delta Weight')
+                plt.plot(data['datetime'], data['theta_weight'], label='Theta Weight')
+                plt.title('Weight Evolution Over Time')
+                plt.xlabel('Time')
+                plt.ylabel('Weight')
+                plt.legend()
+                plt.grid(True)
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, 'weight_evolution.png'))
+                plt.close()
+            
+            logger.info(f"Saved visualizations to {output_dir}")
         
-    Returns:
-        Series: Greek sentiment values
-    """
-    logger.info("Calculating Greek sentiment")
-    
-    try:
-        # Create Greek sentiment calculator
-        calculator = GreekSentimentAnalysis(config)
-        
-        # Calculate Greek sentiment features
-        result_df = calculator.calculate_features(market_data)
-        
-        # Return Greek sentiment series
-        if 'Greek_Sentiment' in result_df.columns:
-            return result_df['Greek_Sentiment']
-        else:
-            logger.warning("Greek_Sentiment column not found in result")
-            return None
-    
-    except Exception as e:
-        logger.error(f"Error calculating Greek sentiment: {str(e)}")
-        return None
+        except Exception as e:
+            logger.error(f"Error visualizing sentiment: {str(e)}")
