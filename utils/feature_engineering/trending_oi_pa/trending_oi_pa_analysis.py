@@ -107,9 +107,6 @@ class TrendingOIWithPAAnalysis:
             'Strong_Bullish': {'occurrences': 0, 'success_rate': 0, 'avg_return': 0, 'avg_duration': 0},
             'Mild_Bullish': {'occurrences': 0, 'success_rate': 0, 'avg_return': 0, 'avg_duration': 0},
             'Neutral': {'occurrences': 0, 'success_rate': 0, 'avg_return': 0, 'avg_duration': 0},
-            'Sideways': {'occurrences': 0, 'success_rate': 0, 'avg_return': 0, 'avg_duration': 0},
-            'Sideways_To_Bullish': {'occurrences': 0, 'success_rate': 0, 'avg_return': 0, 'avg_duration': 0},
-            'Sideways_To_Bearish': {'occurrences': 0, 'success_rate': 0, 'avg_return': 0, 'avg_duration': 0},
             'Mild_Bearish': {'occurrences': 0, 'success_rate': 0, 'avg_return': 0, 'avg_duration': 0},
             'Strong_Bearish': {'occurrences': 0, 'success_rate': 0, 'avg_return': 0, 'avg_duration': 0}
         }
@@ -730,28 +727,12 @@ class TrendingOIWithPAAnalysis:
                      (call_pattern == 'Short_Build_Up'):
                     combined_pattern = 'Mild_Bearish'
                 
-                # Sideways patterns - Added for more granular classification
-                elif (call_pattern == 'Neutral' and put_pattern == 'Neutral') or \
-                     (abs(call_oi_velocity) < self.oi_increase_threshold and abs(put_oi_velocity) < self.oi_increase_threshold):
-                    combined_pattern = 'Sideways'
-                
-                # Sideways to bullish patterns
-                elif (call_pattern == 'Neutral' and (put_pattern == 'Short_Build_Up' or put_pattern == 'Long_Unwinding')) or \
-                     (put_pattern == 'Neutral' and (call_pattern == 'Long_Build_Up' or call_pattern == 'Short_Covering')):
-                    combined_pattern = 'Sideways_To_Bullish'
-                
-                # Sideways to bearish patterns
-                elif (call_pattern == 'Neutral' and (put_pattern == 'Long_Build_Up' or put_pattern == 'Short_Covering')) or \
-                     (put_pattern == 'Neutral' and (call_pattern == 'Short_Build_Up' or call_pattern == 'Long_Unwinding')):
-                    combined_pattern = 'Sideways_To_Bearish'
-                
                 # Update dataframe
                 df.loc[df['strike'] == strike, 'combined_oi_pattern'] = combined_pattern
             
             # Calculate overall pattern
             pattern_counts = df['combined_oi_pattern'].value_counts()
             
-            # Determine the dominant pattern
             if 'Strong_Bullish' in pattern_counts and pattern_counts['Strong_Bullish'] >= 3:
                 df['overall_oi_pattern'] = 'Strong_Bullish'
             elif 'Strong_Bearish' in pattern_counts and pattern_counts['Strong_Bearish'] >= 3:
@@ -760,12 +741,6 @@ class TrendingOIWithPAAnalysis:
                 df['overall_oi_pattern'] = 'Mild_Bullish'
             elif 'Mild_Bearish' in pattern_counts and pattern_counts['Mild_Bearish'] >= 3:
                 df['overall_oi_pattern'] = 'Mild_Bearish'
-            elif 'Sideways' in pattern_counts and pattern_counts['Sideways'] >= 3:
-                df['overall_oi_pattern'] = 'Sideways'
-            elif 'Sideways_To_Bullish' in pattern_counts and pattern_counts['Sideways_To_Bullish'] >= 3:
-                df['overall_oi_pattern'] = 'Sideways_To_Bullish'
-            elif 'Sideways_To_Bearish' in pattern_counts and pattern_counts['Sideways_To_Bearish'] >= 3:
-                df['overall_oi_pattern'] = 'Sideways_To_Bearish'
             else:
                 df['overall_oi_pattern'] = 'Neutral'
         
@@ -946,31 +921,6 @@ class TrendingOIWithPAAnalysis:
                     
                     df.loc[df['datetime'] == current_timestamp, 'institutional_divergence'] = inst_divergence
                 
-                # Check for OI velocity divergence across strikes
-                if 'call_oi_velocity' in current_data.columns and 'put_oi_velocity' in current_data.columns:
-                    # Calculate standard deviation of OI velocity across strikes
-                    call_velocity_std = current_data[current_data['option_type'] == 'call']['call_oi_velocity'].std()
-                    put_velocity_std = current_data[current_data['option_type'] == 'put']['put_oi_velocity'].std()
-                    
-                    # Detect high dispersion in OI velocity (indicating divergence across strikes)
-                    velocity_divergence = False
-                    if call_velocity_std > self.high_velocity_threshold or put_velocity_std > self.high_velocity_threshold:
-                        velocity_divergence = True
-                    
-                    df.loc[df['datetime'] == current_timestamp, 'velocity_divergence'] = velocity_divergence
-                
-                # Check for divergence between OI patterns and price action
-                if 'price_velocity' in current_data.columns:
-                    price_velocity = current_data['price_velocity'].iloc[0]
-                    
-                    # Detect divergence between OI pattern and price action
-                    price_divergence = False
-                    if (current_pattern.endswith('Bullish') and price_velocity < 0) or \
-                       (current_pattern.endswith('Bearish') and price_velocity > 0):
-                        price_divergence = True
-                    
-                    df.loc[df['datetime'] == current_timestamp, 'price_divergence'] = price_divergence
-                
                 # Calculate overall divergence score
                 divergence_score = 0
                 divergence_count = 0
@@ -981,14 +931,6 @@ class TrendingOIWithPAAnalysis:
                 
                 if 'institutional_divergence' in df.columns:
                     divergence_score += df.loc[df['datetime'] == current_timestamp, 'institutional_divergence'].iloc[0]
-                    divergence_count += 1
-                
-                if 'velocity_divergence' in df.columns:
-                    divergence_score += df.loc[df['datetime'] == current_timestamp, 'velocity_divergence'].iloc[0]
-                    divergence_count += 1
-                
-                if 'price_divergence' in df.columns:
-                    divergence_score += df.loc[df['datetime'] == current_timestamp, 'price_divergence'].iloc[0]
                     divergence_count += 1
                 
                 if divergence_count > 0:
@@ -1096,22 +1038,6 @@ class TrendingOIWithPAAnalysis:
                     plt.ylabel('Divergence Score')
                     plt.tight_layout()
                     plt.savefig(os.path.join(output_dir, 'divergence_score.png'))
-                    plt.close()
-                
-                # Plot divergence types if available
-                divergence_types = ['skew_divergence', 'institutional_divergence', 'velocity_divergence', 'price_divergence']
-                available_types = [col for col in divergence_types if col in data.columns]
-                
-                if available_types:
-                    plt.figure(figsize=(12, 6))
-                    for div_type in available_types:
-                        data.groupby('datetime')[div_type].mean().plot(label=div_type)
-                    plt.title('Divergence Types Over Time')
-                    plt.xlabel('Timestamp')
-                    plt.ylabel('Divergence (0=None, 1=Divergent)')
-                    plt.legend()
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(output_dir, 'divergence_types.png'))
                     plt.close()
             
             logger.info(f"Saved OI pattern visualizations to {output_dir}")
