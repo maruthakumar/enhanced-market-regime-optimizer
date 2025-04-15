@@ -394,10 +394,10 @@ class GreekSentimentAnalysis:
                (df['Sentiment_Score'] <= self.sentiment_thresholds['strong_bullish']), 'Greek_Sentiment'] = 'Mild_Bullish'
         df.loc[(df['Sentiment_Score'] > self.sentiment_thresholds['neutral_upper']) & 
                (df['Sentiment_Score'] <= self.sentiment_thresholds['mild_bullish']), 'Greek_Sentiment'] = 'Sideways_To_Bullish'
-        df.loc[(df['Sentiment_Score'] > self.sentiment_thresholds['neutral_lower']) & 
-               (df['Sentiment_Score'] <= self.sentiment_thresholds['neutral_upper']), 'Greek_Sentiment'] = 'Neutral'
-        df.loc[(df['Sentiment_Score'] <= self.sentiment_thresholds['neutral_lower']) & 
-               (df['Sentiment_Score'] > self.sentiment_thresholds['mild_bearish']), 'Greek_Sentiment'] = 'Sideways_To_Bearish'
+        df.loc[(df['Sentiment_Score'] <= self.sentiment_thresholds['neutral_upper']) & 
+               (df['Sentiment_Score'] >= self.sentiment_thresholds['neutral_lower']), 'Greek_Sentiment'] = 'Neutral'
+        df.loc[(df['Sentiment_Score'] < self.sentiment_thresholds['neutral_lower']) & 
+               (df['Sentiment_Score'] >= self.sentiment_thresholds['mild_bearish']), 'Greek_Sentiment'] = 'Sideways_To_Bearish'
         df.loc[(df['Sentiment_Score'] <= self.sentiment_thresholds['mild_bearish']) & 
                (df['Sentiment_Score'] > self.sentiment_thresholds['strong_bearish']), 'Greek_Sentiment'] = 'Mild_Bearish'
         df.loc[df['Sentiment_Score'] <= self.sentiment_thresholds['strong_bearish'], 'Greek_Sentiment'] = 'Strong_Bearish'
@@ -670,3 +670,120 @@ class GreekSentimentAnalysis:
         
         except Exception as e:
             logger.error(f"Error visualizing sentiment: {str(e)}")
+            
+    def get_greek_regime_component(self, data_frame, delta_col='call_delta', gamma_col='call_gamma', theta_col='call_theta', vega_col='call_vega'):
+        """
+        Get the Greek sentiment regime component for market regime classification.
+        
+        Args:
+            data_frame (pd.DataFrame): Input data
+            delta_col (str): Column name for delta values
+            gamma_col (str): Column name for gamma values
+            theta_col (str): Column name for theta values
+            vega_col (str): Column name for vega values
+            
+        Returns:
+            pd.DataFrame: Data with Greek sentiment regime component
+        """
+        try:
+            # Make a copy to avoid modifying the original
+            df = data_frame.copy()
+            
+            # Check if required columns exist
+            required_columns = [delta_col, vega_col]
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            
+            if missing_columns:
+                logger.warning(f"Missing required columns for Greek sentiment analysis: {missing_columns}")
+                df['Greek_Regime_Component'] = self.default_weight
+                df['Greek_Confidence'] = 0.5
+                return df
+            
+            # Check if datetime column exists
+            if 'datetime' not in df.columns and 'timestamp' in df.columns:
+                df['datetime'] = df['timestamp']
+            elif 'datetime' not in df.columns and 'date' in df.columns:
+                df['datetime'] = df['date']
+            elif 'datetime' not in df.columns:
+                # Create a datetime column with index as proxy
+                df['datetime'] = pd.date_range(start='2025-01-01', periods=len(df), freq='1min')
+                logger.warning("Created synthetic datetime column for Greek sentiment analysis")
+            
+            # Ensure datetime is in datetime format
+            if not pd.api.types.is_datetime64_any_dtype(df['datetime']):
+                try:
+                    df['datetime'] = pd.to_datetime(df['datetime'])
+                except:
+                    logger.warning("Failed to convert datetime column to datetime format")
+            
+            # Create option_type column if it doesn't exist
+            if 'option_type' not in df.columns:
+                # Assume we're working with call options if using call_delta, etc.
+                if delta_col.startswith('call_'):
+                    df['option_type'] = 'call'
+                elif delta_col.startswith('put_'):
+                    df['option_type'] = 'put'
+                else:
+                    # Default to call
+                    df['option_type'] = 'call'
+                    logger.warning("Assuming call options for Greek sentiment analysis")
+            
+            # Map columns to standard names for analysis
+            column_mapping = {}
+            if delta_col != 'delta':
+                column_mapping[delta_col] = 'delta'
+            if gamma_col != 'gamma' and gamma_col in df.columns:
+                column_mapping[gamma_col] = 'gamma'
+            if theta_col != 'theta' and theta_col in df.columns:
+                column_mapping[theta_col] = 'theta'
+            if vega_col != 'vega' and vega_col in df.columns:
+                column_mapping[vega_col] = 'vega'
+            
+            # Create temporary columns with standard names
+            for orig_col, std_col in column_mapping.items():
+                df[std_col] = df[orig_col]
+            
+            # Analyze Greek sentiment
+            result_df = self.analyze_greek_sentiment(df)
+            
+            # Convert sentiment score to regime component (0 to 1 scale)
+            result_df['Greek_Regime_Component'] = (result_df['Sentiment_Score'] + 1) / 2
+            
+            # Use sentiment confidence as regime confidence
+            result_df['Greek_Confidence'] = result_df['Sentiment_Confidence']
+            
+            # Map sentiment to regime type
+            sentiment_to_regime = {
+                'Strong_Bullish': 'Bullish',
+                'Mild_Bullish': 'Moderately_Bullish',
+                'Sideways_To_Bullish': 'Sideways_Bullish',
+                'Neutral': 'Sideways',
+                'Sideways_To_Bearish': 'Sideways_Bearish',
+                'Mild_Bearish': 'Moderately_Bearish',
+                'Strong_Bearish': 'Bearish'
+            }
+            
+            result_df['Greek_Regime_Type'] = result_df['Greek_Sentiment'].map(sentiment_to_regime)
+            
+            # Clean up temporary columns
+            for std_col in set(column_mapping.values()):
+                if std_col in result_df.columns and std_col not in data_frame.columns:
+                    result_df = result_df.drop(std_col, axis=1)
+            
+            logger.info("Generated Greek sentiment regime component")
+            
+            # Return only the original columns plus the new regime columns
+            original_cols = data_frame.columns.tolist()
+            new_cols = ['Greek_Regime_Component', 'Greek_Confidence', 'Greek_Regime_Type']
+            result_cols = original_cols + [col for col in new_cols if col not in original_cols]
+            
+            return result_df[result_cols]
+            
+        except Exception as e:
+            logger.error(f"Error getting Greek sentiment regime component: {str(e)}")
+            # Return dataframe with default component value
+            df = data_frame.copy()
+            df['Greek_Regime_Component'] = self.default_weight
+            df['Greek_Confidence'] = 0.5
+            df['Greek_Regime_Type'] = 'Unknown'
+            return df
