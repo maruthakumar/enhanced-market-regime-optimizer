@@ -375,23 +375,257 @@ class DynamicWeightAdjustment:
             # Blend optimized weights with current weights
             for component in optimal_weights:
                 if component in optimized_weights:
-                    optimal_weights[component] = (
-                        0.7 * optimized_weights[component] + 
-                        0.3 * optimal_weights[component]
-                    )
+                    # Apply learning rate to smooth transition
+                    optimal_weights[component] = (1 - self.learning_rate) * optimal_weights[component] + self.learning_rate * optimized_weights[component]
         
-        # Adjust weights by performance and divergence
-        performance_divergence_weights = self.adjust_weights_by_performance_and_divergence(divergence_scores)
+        # If we have divergence scores, adjust weights
+        if divergence_scores is not None:
+            # Get weights adjusted by performance and divergence
+            adjusted_weights = self.adjust_weights_by_performance_and_divergence(divergence_scores)
+            
+            # Blend adjusted weights with optimal weights
+            for component in optimal_weights:
+                if component in adjusted_weights:
+                    # Apply learning rate to smooth transition
+                    optimal_weights[component] = (1 - self.learning_rate) * optimal_weights[component] + self.learning_rate * adjusted_weights[component]
         
-        # Blend performance-adjusted weights with optimal weights
-        for component in optimal_weights:
-            if component in performance_divergence_weights:
-                optimal_weights[component] = (
-                    0.5 * performance_divergence_weights[component] + 
-                    0.5 * optimal_weights[component]
-                )
+        # Ensure minimum weights
+        optimal_weights = {
+            component: max(weight, self.min_weight)
+            for component, weight in optimal_weights.items()
+        }
+        
+        # Normalize weights to ensure they sum to 1
+        total_weight = sum(optimal_weights.values())
+        optimal_weights = {
+            component: weight / total_weight
+            for component, weight in optimal_weights.items()
+        }
         
         # Update current weights
         self.current_weights = optimal_weights.copy()
         
+        logger.info(f"Optimal weights: {optimal_weights}")
         return optimal_weights
+    
+    def adjust_weights_by_performance(self):
+        """
+        Adjust weights based on recent performance.
+        
+        Returns:
+            dict: Adjusted weights
+        """
+        # Start with current weights
+        adjusted_weights = self.current_weights.copy()
+        
+        # Calculate average performance for each component
+        avg_performance = {}
+        for component, history in self.performance_history.items():
+            if history:
+                avg_performance[component] = sum(history) / len(history)
+            else:
+                avg_performance[component] = 0.5  # Default if no history
+        
+        # If we have performance data for at least one component
+        if avg_performance:
+            # Calculate total performance
+            total_performance = sum(avg_performance.values())
+            
+            # If total performance is positive, adjust weights
+            if total_performance > 0:
+                # Calculate new weights based on performance
+                new_weights = {
+                    component: (perf / total_performance)
+                    for component, perf in avg_performance.items()
+                }
+                
+                # Blend new weights with current weights
+                for component in adjusted_weights:
+                    if component in new_weights:
+                        # Apply learning rate to smooth transition
+                        adjusted_weights[component] = (1 - self.learning_rate) * adjusted_weights[component] + self.learning_rate * new_weights[component]
+        
+        # Ensure minimum weights
+        adjusted_weights = {
+            component: max(weight, self.min_weight)
+            for component, weight in adjusted_weights.items()
+        }
+        
+        # Normalize weights to ensure they sum to 1
+        total_weight = sum(adjusted_weights.values())
+        adjusted_weights = {
+            component: weight / total_weight
+            for component, weight in adjusted_weights.items()
+        }
+        
+        logger.info(f"Adjusted weights by performance: {adjusted_weights}")
+        return adjusted_weights
+    
+    def get_current_weights(self, time_of_day=None, volatility_level=None, market_condition=None):
+        """
+        Get current weights, optionally adjusted for time of day, volatility, and market condition.
+        
+        Args:
+            time_of_day (str, optional): Time of day ('open', 'mid', 'close')
+            volatility_level (str, optional): Volatility level ('low', 'medium', 'high')
+            market_condition (str, optional): Market condition ('trending', 'ranging', 'reversal')
+            
+        Returns:
+            dict: Current weights adjusted for specified conditions
+        """
+        try:
+            # Start with current weights
+            weights = self.current_weights.copy()
+            
+            # Adjust for time of day
+            if time_of_day is not None:
+                weights = self._adjust_for_time_of_day(weights, time_of_day)
+            
+            # Adjust for volatility level
+            if volatility_level is not None:
+                weights = self._adjust_for_volatility(weights, volatility_level)
+            
+            # Adjust for market condition
+            if market_condition is not None:
+                weights = self._adjust_for_market_condition(weights, market_condition)
+            
+            # Ensure minimum weights
+            weights = {
+                component: max(weight, self.min_weight)
+                for component, weight in weights.items()
+            }
+            
+            # Normalize weights to ensure they sum to 1
+            total_weight = sum(weights.values())
+            weights = {
+                component: weight / total_weight
+                for component, weight in weights.items()
+            }
+            
+            logger.info(f"Current weights (adjusted): {weights}")
+            return weights
+            
+        except Exception as e:
+            logger.error(f"Error getting current weights: {str(e)}")
+            return self.current_weights.copy()
+    
+    def _adjust_for_time_of_day(self, weights, time_of_day):
+        """
+        Adjust weights based on time of day.
+        
+        Args:
+            weights (dict): Current weights
+            time_of_day (str): Time of day ('open', 'mid', 'close')
+            
+        Returns:
+            dict: Adjusted weights
+        """
+        adjusted_weights = weights.copy()
+        
+        if time_of_day == 'open':
+            # At market open, increase weight of Greek sentiment and trending OI
+            if 'greek_sentiment' in adjusted_weights:
+                adjusted_weights['greek_sentiment'] *= 1.2
+            if 'trending_oi_pa' in adjusted_weights:
+                adjusted_weights['trending_oi_pa'] *= 1.1
+            # Decrease weight of slower indicators
+            if 'ema' in adjusted_weights:
+                adjusted_weights['ema'] *= 0.9
+            if 'vwap' in adjusted_weights:
+                adjusted_weights['vwap'] *= 0.9
+                
+        elif time_of_day == 'mid':
+            # Mid-day, balanced weights
+            pass
+            
+        elif time_of_day == 'close':
+            # At market close, increase weight of Greek sentiment and EMA
+            if 'greek_sentiment' in adjusted_weights:
+                adjusted_weights['greek_sentiment'] *= 1.1
+            if 'ema' in adjusted_weights:
+                adjusted_weights['ema'] *= 1.1
+            # Decrease weight of trending OI
+            if 'trending_oi_pa' in adjusted_weights:
+                adjusted_weights['trending_oi_pa'] *= 0.9
+        
+        return adjusted_weights
+    
+    def _adjust_for_volatility(self, weights, volatility_level):
+        """
+        Adjust weights based on volatility level.
+        
+        Args:
+            weights (dict): Current weights
+            volatility_level (str): Volatility level ('low', 'medium', 'high')
+            
+        Returns:
+            dict: Adjusted weights
+        """
+        adjusted_weights = weights.copy()
+        
+        if volatility_level == 'high':
+            # In high volatility, increase weight of Greek sentiment and ATR
+            if 'greek_sentiment' in adjusted_weights:
+                adjusted_weights['greek_sentiment'] *= 1.2
+            if 'atr' in adjusted_weights:
+                adjusted_weights['atr'] *= 1.3
+            # Decrease weight of slower indicators
+            if 'ema' in adjusted_weights:
+                adjusted_weights['ema'] *= 0.8
+                
+        elif volatility_level == 'low':
+            # In low volatility, increase weight of EMA and VWAP
+            if 'ema' in adjusted_weights:
+                adjusted_weights['ema'] *= 1.2
+            if 'vwap' in adjusted_weights:
+                adjusted_weights['vwap'] *= 1.2
+            # Decrease weight of ATR
+            if 'atr' in adjusted_weights:
+                adjusted_weights['atr'] *= 0.8
+        
+        return adjusted_weights
+    
+    def _adjust_for_market_condition(self, weights, market_condition):
+        """
+        Adjust weights based on market condition.
+        
+        Args:
+            weights (dict): Current weights
+            market_condition (str): Market condition ('trending', 'ranging', 'reversal')
+            
+        Returns:
+            dict: Adjusted weights
+        """
+        adjusted_weights = weights.copy()
+        
+        if market_condition == 'trending':
+            # In trending market, increase weight of trending OI and EMA
+            if 'trending_oi_pa' in adjusted_weights:
+                adjusted_weights['trending_oi_pa'] *= 1.2
+            if 'ema' in adjusted_weights:
+                adjusted_weights['ema'] *= 1.1
+            # Decrease weight of IV skew
+            if 'iv_skew' in adjusted_weights:
+                adjusted_weights['iv_skew'] *= 0.9
+                
+        elif market_condition == 'ranging':
+            # In ranging market, increase weight of VWAP and IV skew
+            if 'vwap' in adjusted_weights:
+                adjusted_weights['vwap'] *= 1.2
+            if 'iv_skew' in adjusted_weights:
+                adjusted_weights['iv_skew'] *= 1.1
+            # Decrease weight of trending OI
+            if 'trending_oi_pa' in adjusted_weights:
+                adjusted_weights['trending_oi_pa'] *= 0.9
+                
+        elif market_condition == 'reversal':
+            # In reversal, increase weight of Greek sentiment and IV skew
+            if 'greek_sentiment' in adjusted_weights:
+                adjusted_weights['greek_sentiment'] *= 1.2
+            if 'iv_skew' in adjusted_weights:
+                adjusted_weights['iv_skew'] *= 1.2
+            # Decrease weight of EMA
+            if 'ema' in adjusted_weights:
+                adjusted_weights['ema'] *= 0.8
+        
+        return adjusted_weights

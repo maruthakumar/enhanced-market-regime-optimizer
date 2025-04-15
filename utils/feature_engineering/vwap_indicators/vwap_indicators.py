@@ -29,6 +29,9 @@ class VWAPIndicators:
         # VWAP bands
         self.band_multipliers = self.config.get('band_multipliers', [1.0, 1.5, 2.0])
         
+        # Default weight for regime component
+        self.default_weight = self.config.get('default_weight', 0.2)
+        
         logger.info(f"Initialized VWAP Indicators with timeframes: {self.timeframes}")
     
     def calculate_vwap(self, df, high_col='High', low_col='Low', close_col='Close', volume_col='Volume'):
@@ -296,3 +299,97 @@ class VWAPIndicators:
             )
         
         return result_df
+        
+    def get_vwap_regime_component(self, data_frame, price_col='underlying_price', high_col='high', low_col='low', close_col='close', volume_col='volume'):
+        """
+        Get the VWAP regime component for market regime classification.
+        
+        Args:
+            data_frame (pd.DataFrame): Input data
+            price_col (str): Column name for price data (used if high/low/close not available)
+            high_col (str): Column name for high price
+            low_col (str): Column name for low price
+            close_col (str): Column name for close price
+            volume_col (str): Column name for volume
+            
+        Returns:
+            pd.DataFrame: Data with VWAP regime component
+        """
+        try:
+            # Make a copy to avoid modifying the original
+            df = data_frame.copy()
+            
+            # Check if required columns exist
+            required_columns = [volume_col]
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            
+            # If high/low/close are missing, use price_col as a substitute
+            if high_col not in df.columns and price_col in df.columns:
+                df[high_col] = df[price_col]
+                logger.info(f"Using {price_col} as substitute for {high_col}")
+            
+            if low_col not in df.columns and price_col in df.columns:
+                df[low_col] = df[price_col]
+                logger.info(f"Using {price_col} as substitute for {low_col}")
+            
+            if close_col not in df.columns and price_col in df.columns:
+                df[close_col] = df[price_col]
+                logger.info(f"Using {price_col} as substitute for {close_col}")
+            
+            # Check again after substitutions
+            required_columns = [high_col, low_col, close_col, volume_col]
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            
+            if missing_columns:
+                logger.warning(f"Missing required columns for VWAP calculation: {missing_columns}")
+                df['VWAP_Regime_Component'] = self.default_weight
+                df['VWAP_Confidence'] = 0.5
+                return df
+            
+            # Calculate VWAP
+            df['VWAP'] = self.calculate_vwap(df, high_col, low_col, close_col, volume_col)
+            
+            # Calculate VWAP bands
+            df = self.calculate_vwap_bands(df, 'VWAP', high_col, low_col, close_col, volume_col)
+            
+            # Get VWAP signals
+            vwap_signal = self.get_vwap_signal(df, close_col, 'VWAP')
+            band_signal = self.get_vwap_band_signal(df, close_col, 'VWAP')
+            crossover_signal = self.get_vwap_crossover_signal(df, close_col, 'VWAP')
+            
+            # Combine signals
+            combined_signal = 0.4 * vwap_signal + 0.4 * band_signal + 0.2 * crossover_signal
+            
+            # Convert signal (-1 to 1) to regime component (0 to 1)
+            df['VWAP_Regime_Component'] = (combined_signal + 1) / 2
+            
+            # Calculate confidence based on signal strength and consistency
+            df['VWAP_Confidence'] = abs(combined_signal)
+            
+            # Check for previous day's VWAP if date column exists
+            if 'datetime' in df.columns:
+                df = self.calculate_previous_day_vwap(df, 'datetime', high_col, low_col, close_col, volume_col)
+                
+                # If previous day's VWAP exists, use it to adjust confidence
+                if 'Prev_Day_VWAP' in df.columns:
+                    # Calculate distance from previous day's VWAP
+                    df['Prev_Day_VWAP_Distance'] = abs((df[close_col] - df['Prev_Day_VWAP']) / df['Prev_Day_VWAP'])
+                    
+                    # Adjust confidence based on distance from previous day's VWAP
+                    # Higher distance = higher confidence in the signal
+                    df['VWAP_Confidence'] = df['VWAP_Confidence'] * (1 + df['Prev_Day_VWAP_Distance'])
+                    
+                    # Clip confidence to [0, 1]
+                    df['VWAP_Confidence'] = df['VWAP_Confidence'].clip(0, 1)
+            
+            logger.info("Generated VWAP regime component")
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error getting VWAP regime component: {str(e)}")
+            # Return dataframe with default component value
+            df = data_frame.copy()
+            df['VWAP_Regime_Component'] = self.default_weight
+            df['VWAP_Confidence'] = 0.5
+            return df
